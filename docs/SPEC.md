@@ -27,7 +27,8 @@ Ce que la documentation publique affirme (observé) :
 | Vue source / glow / rendu final | `view` |
 | Contrôles de downsample et de qualité | `downsample`, `base_sigma` |
 | Tonemapping cinématique | `tonemap` (courbe ACES ajustée) |
-| Texture de saleté de lentille, glow basé sur image, mode iris | Pas encore (phase 3) |
+| Texture de saleté de lentille | `dirt_amount` + texture |
+| Glow basé sur image, mode iris | Pas encore (phase 3) |
 | 8/16/32 bpc, GPU requis | Cible du plugin (phase 2) |
 
 Rien de public ne décrit l'implémentation interne de Deep Glow ; tout ce qui
@@ -48,8 +49,26 @@ suit est notre choix de conception.
 5. Par canal, σ multiplié par `rgb_radius[c]` ; en x/y par √aspect et 1/√aspect.
 6. Chaque niveau est teinté (interpolation dans `tint`), puis la cascade tente
    les additionne du plus grossier au plus fin ; le tout × 2^exposure.
-7. Composite additif en linéaire sur la source prémultipliée, tonemap
-   optionnel, réencodage.
+7. Composite en linéaire sur la source prémultipliée : `add` (src + g) ou
+   `screen` (src + g·(1 − clamp(src, 0, 1)), ne dépasse jamais 1 si src, g ≤ 1).
+   Tonemap optionnel, réencodage.
+
+### Saleté de lentille, profondeur, occlusion
+
+- **Saleté** (`dirt_amount`, texture H×W×3 linéarisée si `gamma_correct`) :
+  glow += dirt_amount · dirt · G_large, où G_large est la somme non teintée
+  des niveaux k ≥ n // 2, mêmes poids. Non soumise à l'occlusion (elle est
+  sur la lentille).
+- **Étalement par profondeur** (`depth_spread` ∈ [0, 1], carte 0 = proche,
+  1 = loin) : une source de profondeur d envoie au niveau k
+  w_k · lerp(1, 2^(k − n/2), s·d), renormalisé à 1 par source. Le facteur
+  étant affine en d après division par Z(d) = 1 + s·d·Σ w_k c_k, on calcule
+  deux pyramides a = src/Z et b = src·s·d/Z ; entrée du niveau k =
+  a_k + c_k·b_k avec c_k = 2^(k − n/2) − 1.
+- **Occlusion** (`occlusion`, `occlusion_softness` = ε) : deux canaux en plus
+  dans la même cascade, I = moyenne RGB de l'entrée et I·d (σ sans
+  multiplicateur RGB). d_moy = (I·d)_glow / I_glow, puis
+  glow ×= 1 − smoothstep(0, ε, d_moy − d(p)).
 
 ## Implémentation de référence
 

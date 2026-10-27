@@ -4,7 +4,7 @@ This is the "source of truth" for the look: the After Effects plugin must
 match its output. Images are float32 arrays of shape (H, W, 3) or (H, W, 4),
 encoded in the comp's working space (sRGB-like gamma unless linear=True).
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -25,6 +25,11 @@ class GlowParams:
     base_sigma: float = 1.5          # sigma of the tightest level, in pixels
     downsample: int = 1              # extra global downsample (speed / stylized grain)
     view: str = "final"              # "final" | "glow" | "source"
+    blend: str = "add"               # "add" | "screen" (screen never pushes src <= 1 past 1)
+    dirt_amount: float = 0.0         # lens dirt strength (needs a dirt texture)
+    depth_spread: float = 0.0        # 0..1: far sources (depth 1) push energy to wide levels
+    occlusion: bool = False          # nearer pixels mask the glow of farther sources
+    occlusion_softness: float = 0.05  # depth range of the occlusion smoothstep
 
 
 def srgb_to_linear(x):
@@ -152,44 +157,102 @@ def upsample_tent2(img, shape):
 TENT_STEP_VARIANCE = 0.6875
 
 
-def glow_layer(src_lin, p: GlowParams):
+def smoothstep(e0, e1, x):
+    t = np.clip((x - e0) / max(e1 - e0, 1e-6), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _resize_to(img, shape):
+    return img if img.shape[:2] == tuple(shape) else upsample_to(img, shape)
+
+
+def glow_layer(src_lin, p: GlowParams, depth=None, dirt=None):
     """Glow only, in linear light, same size as src_lin (H, W, 3).
 
     Levels are blurred at 1/2^k resolution, then folded back from coarsest to
     finest with a 2x tent upsample per step (~1.33x the image in total work).
     Each level's blur is shrunk by the variance its upsample chain adds back,
     so the effective sigma stays base_sigma * 2^k.
+
+    depth: optional (H, W) map, 0 = near, 1 = far. dirt: optional (H, W, 3)
+    lens dirt texture, already in linear light.
     """
     H, W = src_lin.shape[:2]
-    img = soft_threshold(src_lin, p.threshold, p.threshold_smooth)
+    thr = soft_threshold(src_lin, p.threshold, p.threshold_smooth)
+    d = None if depth is None else _resize_to(np.asarray(depth, np.float32)[..., None], (H, W))
     for _ in range(int(np.log2(max(p.downsample, 1)))):
-        img = downsample2(img)
-    scale = H / img.shape[0]
+        thr = downsample2(thr)
+        d = None if d is None else downsample2(d)
+    scale = H / thr.shape[0]
     n = max(1, int(np.floor(np.log2(max(p.radius / p.base_sigma, 1.0)))) + 1)
     weights = level_weights(n, p.spread)
     ax, ay = np.sqrt(p.aspect), 1.0 / np.sqrt(p.aspect)
     sigma_level = p.base_sigma / scale  # same in every level's own pixels
-    levels = [img]
-    for _ in range(1, n):
-        levels.append(downsample2(levels[-1]))
+    occlude = p.occlusion and d is not None
+    spread = 0.0 if d is None else float(np.clip(p.depth_spread, 0.0, 1.0))
+    large_from = n // 2  # levels feeding the lens dirt
 
-    def blur_level(k):
+    # Depth spread: a source at depth d sends w_k * lerp(1, 2^(k - n/2), spread * d)
+    # to level k, renormalized so its total is 1. That factor is affine in d
+    # once divided by Z(d), so two pyramids (a, b) replace one per level:
+    # level input k = down^k(a) + c_k * down^k(b), c_k = 2^(k - n/2) - 1.
+    c = 2.0 ** (np.arange(n) - n / 2.0) - 1.0
+    if spread > 0:
+        z = 1.0 + spread * d * float(np.dot(weights, c))
+        a_img, b_img = thr / z, thr * spread * d / z
+    else:
+        a_img, b_img = thr, None
+
+    def extend(img):
+        # Channels 3-4 carry intensity and intensity * depth for occlusion.
+        if not occlude:
+            return img
+        i = img.mean(axis=-1, keepdims=True)
+        return np.concatenate([img, i, i * d], axis=-1)
+
+    pyr_a = [extend(a_img)]
+    pyr_b = None if b_img is None else [extend(b_img)]
+    for _ in range(1, n):
+        pyr_a.append(downsample2(pyr_a[-1]))
+        if pyr_b is not None:
+            pyr_b.append(downsample2(pyr_b[-1]))
+
+    def contribution(k):
         # Variance added by the k upsample steps back to level 0, in level-k texels.
         extra = TENT_STEP_VARIANCE * (4.0 / 3.0) * (1.0 - 4.0 ** -k)
-        out = np.empty_like(levels[k])
-        for c in range(3):
-            s = sigma_level * p.rgb_radius[c]
+        lvl = pyr_a[k] if pyr_b is None else pyr_a[k] + c[k] * pyr_b[k]
+        blurred = np.empty_like(lvl)
+        for ch in range(lvl.shape[-1]):
+            s = sigma_level * (p.rgb_radius[ch] if ch < 3 else 1.0)
             sx = np.sqrt(max((s * ax) ** 2 - extra, 0.0))
             sy = np.sqrt(max((s * ay) ** 2 - extra, 0.0))
-            out[..., c] = gaussian(levels[k][..., c:c + 1], sx, sy)[..., 0]
-        return weights[k] * _tint_for_level(p.tint, k, n) * out
+            blurred[..., ch] = gaussian(lvl[..., ch:ch + 1], sx, sy)[..., 0]
+        rgb = blurred[..., :3]
+        # Folded channels: tinted glow (3), untinted wide glow (3), occlusion (2).
+        parts = [weights[k] * _tint_for_level(p.tint, k, n) * rgb,
+                 weights[k] * rgb * (k >= large_from)]
+        if occlude:
+            parts.append(weights[k] * blurred[..., 3:5])
+        return np.concatenate(parts, axis=-1)
 
-    acc = blur_level(n - 1)
+    acc = contribution(n - 1)
     for k in range(n - 2, -1, -1):
-        acc = upsample_tent2(acc, levels[k].shape[:2]) + blur_level(k)
-    if acc.shape[:2] != (H, W):
-        acc = upsample_to(acc, (H, W))
-    return acc * 2.0 ** p.exposure
+        acc = upsample_tent2(acc, pyr_a[k].shape[:2]) + contribution(k)
+    acc = _resize_to(acc, (H, W))
+    glow, large = acc[..., :3], acc[..., 3:6]
+    if occlude:
+        d_full = _resize_to(np.asarray(depth, np.float32)[..., None], (H, W))
+        d_mean = acc[..., 7:8] / np.maximum(acc[..., 6:7], 1e-8)
+        glow = glow * (1.0 - smoothstep(0.0, p.occlusion_softness, d_mean - d_full))
+    if dirt is not None and p.dirt_amount > 0:
+        glow = glow + p.dirt_amount * _resize_to(np.asarray(dirt, np.float32)[..., :3], (H, W)) * large
+    return glow * 2.0 ** p.exposure
+
+
+def composite(src, glow, blend):
+    if blend == "screen":
+        return src + glow * (1.0 - np.clip(src, 0.0, 1.0))
+    return src + glow
 
 
 def aces_fitted(x):
@@ -197,7 +260,9 @@ def aces_fitted(x):
     return np.clip(x * (a * x + b) / (x * (c * x + d) + e), 0, 1)
 
 
-def render(src, p: GlowParams):
+def render(src, p: GlowParams, depth=None, dirt=None):
+    """depth: optional (H, W), 0 = near, 1 = far. dirt: optional (H, W, 3)
+    lens dirt texture in the same encoding as src."""
     rgb = src[..., :3].astype(np.float32)
     alpha = src[..., 3:4].astype(np.float32) if src.shape[-1] == 4 else np.ones_like(rgb[..., :1])
     if p.unmult:
@@ -208,8 +273,10 @@ def render(src, p: GlowParams):
     if p.view == "source":
         out = lin_premult
     else:
-        g = glow_layer(lin_premult, p)
-        out = g if p.view == "glow" else lin_premult + g
+        if dirt is not None and p.gamma_correct:
+            dirt = srgb_to_linear(np.asarray(dirt, np.float32)[..., :3])
+        g = glow_layer(lin_premult, p, depth=depth, dirt=dirt)
+        out = g if p.view == "glow" else composite(lin_premult, g, p.blend)
     if p.tonemap:
         out = aces_fitted(out)
     out = linear_to_srgb(out) if p.gamma_correct else out
