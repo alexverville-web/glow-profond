@@ -20,7 +20,7 @@ struct GlowParams {
     float radius = 400.0f;           // largest blur sigma, in pixels
     float exposure = 0.0f;           // stops applied to the glow
     float threshold = 0.0f;          // in linear light
-    float threshold_smooth = 0.25f;  // soft knee width, linear light
+    float threshold_smooth = 0.5f;   // soft knee, as a fraction of threshold (0..1)
     float spread = 2.0f;             // falloff exponent p: glow ~ 1/r^p
     float aspect = 1.0f;             // >1 stretches horizontally, <1 vertically
     Rgb rgb_radius = {1.0f, 1.0f, 1.0f};  // per-channel radius multipliers
@@ -63,7 +63,7 @@ Image render(const Image& src, const GlowParams& p);
 Image render_premultiplied(const Image& src, const GlowParams& p);
 
 // Building blocks, exposed for tests.
-Image soft_threshold(const Image& rgb, float t, float knee);
+Image soft_threshold(const Image& rgb, float t, float smooth);
 Image downsample2(const Image& img);
 Image upsample_to(const Image& img, int width, int height);
 void blur_axis(Image& img, int channel, float sigma, bool vertical);

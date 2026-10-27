@@ -279,7 +279,7 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data) {
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Seuil", 0, 100, 0, 2, 0, PF_Precision_HUNDREDTHS, 0, 0, ID_THRESHOLD);
     AEFX_CLR_STRUCT(def);
-    PF_ADD_FLOAT_SLIDERX("Douceur du seuil", 0, 10, 0, 1, 0.25, PF_Precision_HUNDREDTHS, 0, 0, ID_THRESHOLD_SMOOTH);
+    PF_ADD_FLOAT_SLIDERX("Douceur du seuil", 0, 1, 0, 1, 0.5, PF_Precision_HUNDREDTHS, 0, 0, ID_THRESHOLD_SMOOTH);
     AEFX_CLR_STRUCT(def);
     PF_ADD_CHECKBOXX("Unmult (alpha = luma)", FALSE, 0, ID_UNMULT);
     AEFX_CLR_STRUCT(def);

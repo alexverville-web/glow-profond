@@ -111,7 +111,7 @@ int usage() {
                  "  --radius F            largest blur sigma in px (400)\n"
                  "  --exposure F          stops (0)\n"
                  "  --threshold F         linear light (0)\n"
-                 "  --threshold-smooth F  soft knee (0.25)\n"
+                 "  --threshold-smooth F  soft knee, fraction of threshold 0..1 (0.5)\n"
                  "  --spread F            falloff exponent, 2 = 1/r^2 (2)\n"
                  "  --aspect F            >1 horizontal (1)\n"
                  "  --rgb-radius R,G,B    per-channel radius multipliers (1,1,1)\n"

@@ -49,10 +49,17 @@ static void test_threshold() {
     img.px(0, 0)[0] = 0.1f;   // well below t - knee
     img.px(1, 0)[0] = 2.0f;   // well above t + knee
     img.px(2, 0)[0] = 0.5f;   // inside the knee
-    const Image t = soft_threshold(img, 0.5f, 0.1f);
+    const Image t = soft_threshold(img, 0.5f, 0.2f);  // knee = 0.1
     CHECK(t.px(0, 0)[0] == 0.0f);
     CHECK(std::fabs(t.px(1, 0)[0] - 1.5f) < 1e-6f);
     CHECK(t.px(2, 0)[0] > 0.0f && t.px(2, 0)[0] < 0.5f);
+
+    // Threshold 0 passes everything through, dark pixels included.
+    Image dark(2, 1, 3);
+    dark.px(0, 0)[1] = 0.001f;
+    dark.px(1, 0)[2] = 0.3f;
+    const Image same = soft_threshold(dark, 0.0f, 0.5f);
+    for (size_t i = 0; i < dark.data.size(); ++i) CHECK(std::fabs(same.data[i] - dark.data[i]) < 1e-7f);
 }
 
 static void test_level_count() {

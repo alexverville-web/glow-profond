@@ -70,9 +70,10 @@ float aces_fitted(float x) {
     return std::clamp(x * (a * x + b) / (x * (c * x + d) + e), 0.0f, 1.0f);
 }
 
-Image soft_threshold(const Image& rgb, float t, float knee) {
+Image soft_threshold(const Image& rgb, float t, float smooth) {
     Image out = rgb;
-    knee = std::max(knee, 1e-5f);
+    // Knee relative to the threshold: t = 0 passes the image through unchanged.
+    const float knee = std::max(t * smooth, 1e-5f);
     parallel_rows(rgb.height, [&](int y) {
         for (int x = 0; x < rgb.width; ++x) {
             float* p = out.px(x, y);
