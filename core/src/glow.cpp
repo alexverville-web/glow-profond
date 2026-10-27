@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <thread>
 
@@ -15,6 +16,9 @@ namespace {
 constexpr float kTentStepVariance = 0.6875f;
 
 // Runs fn(row) for every row in [0, rows), split across hardware threads.
+// Rows are handed out in small chunks from a shared counter: on Apple Silicon
+// the efficiency cores are much slower, and a fixed split made every pass
+// wait for them.
 template <class Fn>
 void parallel_rows(int rows, Fn fn) {
     const int hw = int(std::max(1u, std::thread::hardware_concurrency()));
@@ -23,14 +27,47 @@ void parallel_rows(int rows, Fn fn) {
         for (int y = 0; y < rows; ++y) fn(y);
         return;
     }
+    const int chunk = std::max(1, rows / (workers * 8));
+    std::atomic<int> next{0};
+    auto work = [&] {
+        for (int start; (start = next.fetch_add(chunk)) < rows;) {
+            const int end = std::min(rows, start + chunk);
+            for (int y = start; y < end; ++y) fn(y);
+        }
+    };
     std::vector<std::thread> pool;
-    pool.reserve(workers);
-    for (int w = 0; w < workers; ++w) {
-        pool.emplace_back([=] {
-            for (int y = w; y < rows; y += workers) fn(y);
-        });
-    }
+    pool.reserve(size_t(workers - 1));
+    for (int w = 1; w < workers; ++w) pool.emplace_back(work);
+    work();  // the calling thread works too
     for (auto& t : pool) t.join();
+}
+
+// sRGB curves tabulated on [0, 1] against sqrt(x): in that variable both are
+// smooth enough for linear interpolation to stay under 1e-6, where pow() was
+// the most expensive per-pixel operation. Values above 1 (HDR) use pow().
+constexpr int kSrgbLutSize = 4096;
+
+struct SrgbLuts {
+    float to_linear[kSrgbLutSize + 1];
+    float to_srgb[kSrgbLutSize + 1];
+    SrgbLuts() {
+        for (int i = 0; i <= kSrgbLutSize; ++i) {
+            const double t = double(i) / kSrgbLutSize, x = t * t;
+            to_linear[i] = float(x <= 0.04045 ? x / 12.92 : std::pow((x + 0.055) / 1.055, 2.4));
+            to_srgb[i] = float(x <= 0.0031308 ? x * 12.92 : 1.055 * std::pow(x, 1.0 / 2.4) - 0.055);
+        }
+    }
+};
+
+const SrgbLuts& srgb_luts() {
+    static const SrgbLuts luts;  // thread-safe one-time init
+    return luts;
+}
+
+float lut_lookup(const float* table, float x) {
+    const float f = std::sqrt(x) * float(kSrgbLutSize);
+    const int i = std::min(int(f), kSrgbLutSize - 1);
+    return table[i] + (table[i + 1] - table[i]) * (f - float(i));
 }
 
 std::vector<float> gauss_kernel(float sigma) {
@@ -62,11 +99,13 @@ Rgb tint_for_level(const std::vector<Rgb>& tint, int k, int n) {
 
 float srgb_to_linear(float x) {
     x = std::max(x, 0.0f);
+    if (x <= 1.0f) return lut_lookup(srgb_luts().to_linear, x);
     return x <= 0.04045f ? x / 12.92f : std::pow((x + 0.055f) / 1.055f, 2.4f);
 }
 
 float linear_to_srgb(float x) {
     x = std::max(x, 0.0f);
+    if (x <= 1.0f) return lut_lookup(srgb_luts().to_srgb, x);
     return x <= 0.0031308f ? x * 12.92f : 1.055f * std::pow(x, 1.0f / 2.4f) - 0.055f;
 }
 
@@ -176,20 +215,39 @@ void blur_level(Image& img, const float (&sx)[3], const float (&sy)[3]) {
         if (sx[c] >= 0.3f) { kx[c] = gauss_kernel(sx[c]); any_x = true; }
         if (sy[c] >= 0.3f) { ky[c] = gauss_kernel(sy[c]); any_y = true; }
     }
+    // Without chromatic aberration all channels share one kernel: then each
+    // tap is a multiply-add over a whole contiguous row, which vectorizes.
+    const bool same_x = ch == 3 && sx[0] == sx[1] && sx[1] == sx[2];
+    const bool same_y = ch == 3 && sy[0] == sy[1] && sy[1] == sy[2];
+    const size_t stride = size_t(W) * ch;
     if (any_x) {
+        int rmax = 0;
+        for (int c = 0; c < 3; ++c) rmax = std::max(rmax, int(kx[c].size()) / 2);
         const std::vector<float> src(img.data);
         parallel_rows(H, [&](int y) {
-            const float* row = src.data() + size_t(y) * W * ch;
-            float* out = img.data.data() + size_t(y) * W * ch;
+            // Zero-padded copy of the row: taps never need bounds checks, and
+            // adding k * 0 leaves the sums identical to blur_axis.
+            std::vector<float> pad(stride + size_t(2 * rmax) * ch, 0.0f);
+            std::copy_n(src.data() + size_t(y) * stride, stride, pad.data() + size_t(rmax) * ch);
+            float* out = img.data.data() + size_t(y) * stride;
+            if (same_x) {
+                const int r = int(kx[0].size()) / 2;
+                std::fill(out, out + stride, 0.0f);
+                for (int j = -r; j <= r; ++j) {
+                    const float kj = kx[0][size_t(j + r)];
+                    const float* in = pad.data() + size_t(rmax + j) * ch;
+                    for (size_t i = 0; i < stride; ++i) out[i] += kj * in[i];
+                }
+                return;
+            }
             for (int c = 0; c < 3; ++c) {
                 if (kx[c].empty()) continue;
-                const float* k = kx[c].data();
                 const int r = int(kx[c].size()) / 2;
-                for (int i = 0; i < W; ++i) {
-                    float acc = 0.0f;
-                    const int lo = std::max(0, i - r), hi = std::min(W - 1, i + r);
-                    for (int j = lo; j <= hi; ++j) acc += k[j - i + r] * row[size_t(j) * ch + c];
-                    out[size_t(i) * ch + c] = acc;
+                for (int x = 0; x < W; ++x) out[size_t(x) * ch + c] = 0.0f;
+                for (int j = -r; j <= r; ++j) {
+                    const float kj = kx[c][size_t(j + r)];
+                    const float* in = pad.data() + size_t(rmax + j) * ch + c;
+                    for (int x = 0; x < W; ++x) out[size_t(x) * ch + c] += kj * in[size_t(x) * ch];
                 }
             }
         });
@@ -199,7 +257,18 @@ void blur_level(Image& img, const float (&sx)[3], const float (&sy)[3]) {
         // Row-major traversal: output row i gathers whole input rows, which
         // keeps memory access sequential (columns would thrash the cache).
         parallel_rows(H, [&](int i) {
-            float* out = img.data.data() + size_t(i) * W * ch;
+            float* out = img.data.data() + size_t(i) * stride;
+            if (same_y) {
+                const int r = int(ky[0].size()) / 2;
+                const int lo = std::max(0, i - r), hi = std::min(H - 1, i + r);
+                std::fill(out, out + stride, 0.0f);
+                for (int j = lo; j <= hi; ++j) {
+                    const float kj = ky[0][size_t(j - i + r)];
+                    const float* row = src.data() + size_t(j) * stride;
+                    for (size_t x = 0; x < stride; ++x) out[x] += kj * row[x];
+                }
+                return;
+            }
             for (int c = 0; c < 3; ++c) {
                 if (ky[c].empty()) continue;
                 const float* k = ky[c].data();
@@ -208,7 +277,7 @@ void blur_level(Image& img, const float (&sx)[3], const float (&sy)[3]) {
                 for (int x = 0; x < W; ++x) out[size_t(x) * ch + c] = 0.0f;
                 for (int j = lo; j <= hi; ++j) {
                     const float kj = k[j - i + r];
-                    const float* row = src.data() + size_t(j) * W * ch;
+                    const float* row = src.data() + size_t(j) * stride;
                     for (int x = 0; x < W; ++x) out[size_t(x) * ch + c] += kj * row[size_t(x) * ch + c];
                 }
             }
@@ -251,61 +320,93 @@ void accumulate_upsampled(Image& acc, const Image& img, const Rgb& gain) {
 
 }  // namespace
 
-Image upsample_tent2(const Image& img, int width, int height) {
-    struct Tap {
-        int i0, i1;
-        float f;
-    };
-    // Three taps (-1, 0, +1 source texels) per target coordinate, clamped
-    // like upsample_to, each read bilinearly.
-    auto taps = [](int target, int n) {
-        std::vector<std::array<Tap, 3>> t(static_cast<size_t>(target));
-        for (int i = 0; i < target; ++i) {
-            const float base = (float(i) + 0.5f) * float(n) / float(target) - 0.5f;
-            for (int d = 0; d < 3; ++d) {
-                const float c = std::clamp(base + float(d - 1), 0.0f, float(n - 1));
-                const int i0 = int(std::floor(c));
-                t[i][d] = {i0, std::min(i0 + 1, n - 1), c - float(i0)};
-            }
-        }
-        return t;
-    };
+namespace {
+
+// One output coordinate of upsample_tent2: the three bilinear taps folded
+// into at most four distinct source texels with summed weights.
+struct TentTaps {
+    int idx[4];
+    float w[4];
+    int n;
+};
+
+std::vector<TentTaps> tent_taps(int target, int n) {
     static const float kTent[3] = {0.25f, 0.5f, 0.25f};
+    std::vector<TentTaps> t(static_cast<size_t>(target));
+    for (int i = 0; i < target; ++i) {
+        TentTaps& tt = t[size_t(i)];
+        tt.n = 0;
+        auto add = [&](int idx, float w) {
+            for (int m = 0; m < tt.n; ++m) {
+                if (tt.idx[m] == idx) {
+                    tt.w[m] += w;
+                    return;
+                }
+            }
+            tt.idx[tt.n] = idx;
+            tt.w[tt.n++] = w;
+        };
+        // Taps at -1, 0, +1 source texels around the target's position in
+        // source coordinates, clamped like upsample_to, each read bilinearly.
+        const float base = (float(i) + 0.5f) * float(n) / float(target) - 0.5f;
+        for (int d = 0; d < 3; ++d) {
+            const float c = std::clamp(base + float(d - 1), 0.0f, float(n - 1));
+            const int i0 = int(std::floor(c));
+            const float f = c - float(i0);
+            add(i0, kTent[d] * (1.0f - f));
+            add(std::min(i0 + 1, n - 1), kTent[d] * f);
+        }
+    }
+    return t;
+}
+
+// upsample_tent2(img) + add, in one pass (add may be null): the cascade adds
+// each level right after upsampling the coarser sum into it.
+Image upsample_tent2_add(const Image& img, int width, int height, const Image* add) {
     const int ch = img.channels;
-    const auto tx = taps(width, img.width);
-    const auto ty = taps(height, img.height);
+    const auto tx = tent_taps(width, img.width);
+    const auto ty = tent_taps(height, img.height);
 
     // Along x first (source rows, target width), then along y.
     Image rows(width, img.height, ch);
     parallel_rows(img.height, [&](int y) {
         for (int x = 0; x < width; ++x) {
+            const TentTaps& t = tx[size_t(x)];
             float* o = rows.px(x, y);
-            for (int c = 0; c < ch; ++c) {
-                float sum = 0.0f;
-                for (int d = 0; d < 3; ++d) {
-                    const Tap& t = tx[x][d];
-                    sum += kTent[d] * (img.px(t.i0, y)[c] * (1.0f - t.f) + img.px(t.i1, y)[c] * t.f);
-                }
-                o[c] = sum;
+            for (int c = 0; c < ch; ++c) o[c] = 0.0f;
+            for (int m = 0; m < t.n; ++m) {
+                const float* s = img.px(t.idx[m], y);
+                for (int c = 0; c < ch; ++c) o[c] += t.w[m] * s[c];
             }
         }
     });
+    // Along y every tap is a whole row: contiguous multiply-adds.
     Image out(width, height, ch);
+    const size_t stride = size_t(width) * ch;
     parallel_rows(height, [&](int y) {
-        for (int x = 0; x < width; ++x) {
-            float* o = out.px(x, y);
-            for (int c = 0; c < ch; ++c) {
-                float sum = 0.0f;
-                for (int d = 0; d < 3; ++d) {
-                    const Tap& t = ty[y][d];
-                    sum += kTent[d] * (rows.px(x, t.i0)[c] * (1.0f - t.f) + rows.px(x, t.i1)[c] * t.f);
-                }
-                o[c] = sum;
-            }
+        const TentTaps& t = ty[size_t(y)];
+        float* o = out.px(0, y);
+        if (add) {
+            std::copy_n(add->px(0, y), stride, o);
+        } else {
+            std::fill(o, o + stride, 0.0f);
+        }
+        for (int m = 0; m < t.n; ++m) {
+            const float w = t.w[m];
+            const float* r = rows.px(0, t.idx[m]);
+            for (size_t i = 0; i < stride; ++i) o[i] += w * r[i];
         }
     });
     return out;
 }
+
+}  // namespace
+
+Image upsample_tent2(const Image& img, int width, int height) {
+    return upsample_tent2_add(img, width, height, nullptr);
+}
+
+void parallel_for_rows(int rows, const std::function<void(int)>& fn) { parallel_rows(rows, fn); }
 
 int level_count(const GlowParams& p) {
     const float ratio = std::max(p.radius / p.base_sigma, 1.0f);
@@ -318,8 +419,7 @@ Image glow_layer(const Image& src, const GlowParams& p) {
     const int extra = int(std::log2(float(std::max(p.downsample, 1))));
     for (int i = 0; i < extra; ++i) img = downsample2(img);
 
-    Image acc(W, H, 3);
-    if (img.width == 0 || img.height == 0) return acc;
+    if (img.width == 0 || img.height == 0) return Image(W, H, 3);
 
     const float scale = float(H) / float(img.height);
     const int n = level_count(p);
@@ -329,7 +429,9 @@ Image glow_layer(const Image& src, const GlowParams& p) {
         weights[k] = std::pow(std::pow(2.0f, float(k)), 2.0f - p.spread);
         wsum += weights[k];
     }
-    for (float& w : weights) w /= wsum;
+    // Exposure is folded into the level weights: one less full-size pass.
+    const float exposure_gain = std::pow(2.0f, p.exposure);
+    for (float& w : weights) w *= exposure_gain / wsum;
 
     const float ax = std::sqrt(p.aspect), ay = 1.0f / std::sqrt(p.aspect);
     const float sigma_level = p.base_sigma / scale;  // same in every level's own pixels
@@ -370,18 +472,12 @@ Image glow_layer(const Image& src, const GlowParams& p) {
     Image cascade = std::move(levels[size_t(used - 1)]);
     for (int k = used - 2; k >= 0; --k) {
         blur_weighted(k);
-        Image up = upsample_tent2(cascade, levels[size_t(k)].width, levels[size_t(k)].height);
         const Image& lvl = levels[size_t(k)];
-        for (size_t i = 0; i < up.data.size(); ++i) up.data[i] += lvl.data[i];
-        cascade = std::move(up);
+        cascade = upsample_tent2_add(cascade, lvl.width, lvl.height, &lvl);
     }
-    if (cascade.width == W && cascade.height == H) {
-        acc = std::move(cascade);
-    } else {
-        accumulate_upsampled(acc, cascade, {1.0f, 1.0f, 1.0f});
-    }
-    const float gain = std::pow(2.0f, p.exposure);
-    for (float& v : acc.data) v *= gain;
+    if (cascade.width == W && cascade.height == H) return cascade;
+    Image acc(W, H, 3);
+    accumulate_upsampled(acc, cascade, {1.0f, 1.0f, 1.0f});
     return acc;
 }
 

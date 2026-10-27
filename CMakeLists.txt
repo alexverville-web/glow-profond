@@ -32,6 +32,9 @@ if(BUILD_TESTING)
   add_executable(core_test tests/core_test.cpp)
   target_link_libraries(core_test PRIVATE glow_core)
   add_test(NAME core COMMAND core_test)
+  # Timing, not a test: ./glow_bench [width height radius repeats]
+  add_executable(glow_bench tests/bench.cpp)
+  target_link_libraries(glow_bench PRIVATE glow_core)
 
   find_package(Python3 COMPONENTS Interpreter)
   if(Python3_FOUND)

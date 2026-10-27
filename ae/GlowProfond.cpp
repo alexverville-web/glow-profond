@@ -220,34 +220,51 @@ A_long GlowPadding(const GlowParams& p) {
 
 template <class Pixel>
 void ReadPixels(const PF_EffectWorld* world, float max_value, Image& img, int dx, int dy) {
-    for (A_long y = 0; y < world->height; ++y) {
+    glow_profond::parallel_for_rows(int(world->height), [&](int y) {
         const Pixel* row = reinterpret_cast<const Pixel*>(reinterpret_cast<const char*>(world->data) + y * world->rowbytes);
         for (A_long x = 0; x < world->width; ++x) {
-            float* o = img.px(int(x) + dx, int(y) + dy);
+            float* o = img.px(int(x) + dx, y + dy);
             o[0] = float(row[x].red) / max_value;
             o[1] = float(row[x].green) / max_value;
             o[2] = float(row[x].blue) / max_value;
             o[3] = float(row[x].alpha) / max_value;
         }
-    }
+    });
 }
 
+// 8x8 Bayer matrix: an ordered dither breaks the banding that wide, smooth
+// halos show once quantized to 8 (or 16) bits, without frame-to-frame noise.
+const unsigned char kBayer8[8][8] = {
+    {0, 32, 8, 40, 2, 34, 10, 42},   {48, 16, 56, 24, 50, 18, 58, 26}, {12, 44, 4, 36, 14, 46, 6, 38},
+    {60, 28, 52, 20, 62, 30, 54, 22}, {3, 35, 11, 43, 1, 33, 9, 41},   {51, 19, 59, 27, 49, 17, 57, 25},
+    {15, 47, 7, 39, 13, 45, 5, 37},  {63, 31, 55, 23, 61, 29, 53, 21}};
+
+// Integer formats (quantize = true) are dithered, clamped and kept valid
+// premultiplied (colour <= alpha). (ox, oy) is the output's layer-space
+// origin, so the pattern stays put when the output rect moves.
 template <class Pixel, class Channel>
-void WritePixels(const Image& img, int dx, int dy, float max_value, bool clamp, PF_EffectWorld* world) {
-    auto conv = [&](float v) {
-        if (clamp) return static_cast<Channel>(std::clamp(v, 0.0f, 1.0f) * max_value + 0.5f);
-        return static_cast<Channel>(v * max_value);
-    };
-    for (A_long y = 0; y < world->height; ++y) {
+void WritePixels(const Image& img, int dx, int dy, float max_value, bool quantize, A_long ox, A_long oy,
+                 PF_EffectWorld* world) {
+    glow_profond::parallel_for_rows(int(world->height), [&](int y) {
         Pixel* row = reinterpret_cast<Pixel*>(reinterpret_cast<char*>(world->data) + y * world->rowbytes);
         for (A_long x = 0; x < world->width; ++x) {
-            const float* s = img.px(int(x) + dx, int(y) + dy);
-            row[x].red = conv(s[0]);
-            row[x].green = conv(s[1]);
-            row[x].blue = conv(s[2]);
-            row[x].alpha = conv(s[3]);
+            const float* s = img.px(int(x) + dx, y + dy);
+            if (!quantize) {
+                row[x].red = static_cast<Channel>(s[0]);
+                row[x].green = static_cast<Channel>(s[1]);
+                row[x].blue = static_cast<Channel>(s[2]);
+                row[x].alpha = static_cast<Channel>(s[3]);
+                continue;
+            }
+            const float bias = (float(kBayer8[(y + oy) & 7][(x + ox) & 7]) + 0.5f) / 64.0f;
+            auto q = [&](float v) { return std::floor(std::clamp(v, 0.0f, 1.0f) * max_value + bias); };
+            const float a = q(s[3]);
+            row[x].alpha = static_cast<Channel>(a);
+            row[x].red = static_cast<Channel>(std::min(q(s[0]), a));
+            row[x].green = static_cast<Channel>(std::min(q(s[1]), a));
+            row[x].blue = static_cast<Channel>(std::min(q(s[2]), a));
         }
-    }
+    });
 }
 
 PF_Err About(PF_InData* in_data, PF_OutData* out_data) {
@@ -410,15 +427,17 @@ PF_Err SmartRender(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra
         }
         if (!err && src.width > 0 && src.height > 0) {
             const Image result = glow_profond::render_premultiplied(src, p);
+            const A_long ox = plan->output_rect.left, oy = plan->output_rect.top;
             switch (format) {
                 case PF_PixelFormat_ARGB128:
-                    WritePixels<PF_PixelFloat, PF_FpShort>(result, out_dx, out_dy, 1.0f, false, output);
+                    WritePixels<PF_PixelFloat, PF_FpShort>(result, out_dx, out_dy, 1.0f, false, ox, oy, output);
                     break;
                 case PF_PixelFormat_ARGB64:
-                    WritePixels<PF_Pixel16, A_u_short>(result, out_dx, out_dy, float(PF_MAX_CHAN16), true, output);
+                    WritePixels<PF_Pixel16, A_u_short>(result, out_dx, out_dy, float(PF_MAX_CHAN16), true, ox, oy,
+                                                       output);
                     break;
                 default:
-                    WritePixels<PF_Pixel8, A_u_char>(result, out_dx, out_dy, float(PF_MAX_CHAN8), true, output);
+                    WritePixels<PF_Pixel8, A_u_char>(result, out_dx, out_dy, float(PF_MAX_CHAN8), true, ox, oy, output);
                     break;
             }
         }

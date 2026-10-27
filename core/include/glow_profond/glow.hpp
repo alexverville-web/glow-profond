@@ -8,6 +8,7 @@
 
 #include <array>
 #include <cstddef>
+#include <functional>
 #include <vector>
 
 namespace glow_profond {
@@ -61,6 +62,10 @@ Image render(const Image& src, const GlowParams& p);
 // is the result. The glow widens the alpha coverage so it shows past the
 // layer's edges. For opaque input its RGB equals render().
 Image render_premultiplied(const Image& src, const GlowParams& p);
+
+// Runs fn(row) for every row in [0, rows) on all cores (the core's own
+// scheduler, shared with hosts so pixel conversions run in parallel too).
+void parallel_for_rows(int rows, const std::function<void(int)>& fn);
 
 // Building blocks, exposed for tests.
 Image soft_threshold(const Image& rgb, float t, float smooth);
