@@ -83,8 +83,12 @@ def gaussian(img, sx, sy):
 
 
 def downsample2(img):
-    h, w = img.shape[0] // 2 * 2, img.shape[1] // 2 * 2
-    i = img[:h, :w]
+    """2x2 box average. Odd sizes round up, with zeros past the edge: texel i
+    always covers source pixels 2i and 2i + 1, so every level stays aligned
+    with the image (truncating made coarse levels drift by up to 2^k pixels,
+    and the halo moved whenever the buffer size changed)."""
+    h, w = img.shape[:2]
+    i = np.pad(img, ((0, h % 2), (0, w % 2)) + ((0, 0),) * (img.ndim - 2))
     return 0.25 * (i[0::2, 0::2] + i[1::2, 0::2] + i[0::2, 1::2] + i[1::2, 1::2])
 
 
@@ -135,16 +139,17 @@ def _tint_for_level(tint, k, n):
 
 
 def upsample_tent2(img, shape):
-    """3x3 tent upsample (Jimenez, CoD: AW bloom) to an exact (H, W).
+    """3x3 tent upsample (Jimenez, CoD: AW bloom) by exactly 2x, to (H, W).
 
     Bilinear taps at -1/0/+1 source texels around each target pixel's
     position in source coordinates, weights 1-2-1 / 2-4-2 / 1-2-1 over 16,
-    edges clamped like upsample_to.
+    edges clamped like upsample_to. The scale is exactly 2 (the inverse of
+    downsample2), whatever the rounding of the sizes.
     """
     H, W = shape
     h, w = img.shape[:2]
-    ys = (np.arange(H) + 0.5) * h / H - 0.5
-    xs = (np.arange(W) + 0.5) * w / W - 0.5
+    ys = (np.arange(H) + 0.5) / 2.0 - 0.5
+    xs = (np.arange(W) + 0.5) / 2.0 - 0.5
 
     def taps(coords, n):
         out = []
@@ -173,6 +178,20 @@ def smoothstep(e0, e1, x):
     return t * t * (3.0 - 2.0 * t)
 
 
+def upsample_by(img, shape, f):
+    """Bilinear upsample by exactly f (the inverse of f/2 downsample2 steps)."""
+    H, W = shape
+    h, w = img.shape[:2]
+    ys = np.clip((np.arange(H) + 0.5) / f - 0.5, 0, h - 1)
+    xs = np.clip((np.arange(W) + 0.5) / f - 0.5, 0, w - 1)
+    y0, x0 = np.floor(ys).astype(int), np.floor(xs).astype(int)
+    y1, x1 = np.minimum(y0 + 1, h - 1), np.minimum(x0 + 1, w - 1)
+    fy, fx = (ys - y0)[:, None, None], (xs - x0)[None, :, None]
+    top = img[y0][:, x0] * (1 - fx) + img[y0][:, x1] * fx
+    bot = img[y1][:, x0] * (1 - fx) + img[y1][:, x1] * fx
+    return top * (1 - fy) + bot * fy
+
+
 def _resize_to(img, shape):
     return img if img.shape[:2] == tuple(shape) else upsample_to(img, shape)
 
@@ -194,7 +213,7 @@ def glow_layer(src_lin, p: GlowParams, depth=None, dirt=None):
     for _ in range(int(np.log2(max(p.downsample, 1)))):
         thr = downsample2(thr)
         d = None if d is None else downsample2(d)
-    scale = H / thr.shape[0]
+    scale = float(2 ** int(np.log2(max(p.downsample, 1))))
     sigmas, weights = level_plan(p.radius, p.base_sigma, p.spread)
     n = len(sigmas)
     ax, ay = np.sqrt(p.aspect), 1.0 / np.sqrt(p.aspect)
@@ -250,7 +269,8 @@ def glow_layer(src_lin, p: GlowParams, depth=None, dirt=None):
     acc = contribution(n - 1)
     for k in range(n - 2, -1, -1):
         acc = upsample_tent2(acc, pyr_a[k].shape[:2]) + contribution(k)
-    acc = _resize_to(acc, (H, W))
+    if acc.shape[:2] != (H, W):
+        acc = upsample_by(acc, (H, W), 2 ** int(np.log2(max(p.downsample, 1))))
     glow, large = acc[..., :3], acc[..., 3:6]
     if occlude:
         d_full = _resize_to(np.asarray(depth, np.float32)[..., None], (H, W))

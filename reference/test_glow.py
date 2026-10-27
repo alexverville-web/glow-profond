@@ -124,3 +124,15 @@ if __name__ == "__main__":
         if name.startswith("test_"):
             fn()
             print("ok", name)
+
+
+def test_buffer_size_does_not_move_the_glow():
+    # Hosts pad the buffer by an amount that follows the radius: the glow
+    # must stay centred on its source whatever the (odd) buffer size.
+    def glow_in(size):
+        img = np.zeros((size, size, 3), np.float32)
+        img[40:90, 40:90] = 1.0
+        return glow_layer(img, GlowParams(radius=100))[..., 0]
+    a, b = glow_in(257), glow_in(300)
+    assert np.abs(a[:128, :128] - b[:128, :128]).max() < 0.01 * a[65, 30]
+    assert abs(a[65, 30] - a[65, 99]) < 0.03 * a[65, 30]

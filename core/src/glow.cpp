@@ -132,34 +132,45 @@ Image soft_threshold(const Image& rgb, float t, float smooth) {
 }
 
 Image downsample2(const Image& img) {
-    // Odd dimensions are truncated, like the reference.
-    Image out(img.width / 2, img.height / 2, img.channels);
+    // Odd sizes round up, with zeros past the edge (like the reference):
+    // texel i always covers source pixels 2i and 2i + 1, so every level stays
+    // aligned with the image whatever the buffer size.
+    Image out((img.width + 1) / 2, (img.height + 1) / 2, img.channels);
+    const int ch = img.channels;
     parallel_rows(out.height, [&](int y) {
+        const bool has_y1 = 2 * y + 1 < img.height;
         for (int x = 0; x < out.width; ++x) {
+            const bool has_x1 = 2 * x + 1 < img.width;
             const float* a = img.px(2 * x, 2 * y);
-            const float* b = img.px(2 * x + 1, 2 * y);
-            const float* c = img.px(2 * x, 2 * y + 1);
-            const float* d = img.px(2 * x + 1, 2 * y + 1);
+            const float* b = has_x1 ? img.px(2 * x + 1, 2 * y) : nullptr;
+            const float* c = has_y1 ? img.px(2 * x, 2 * y + 1) : nullptr;
+            const float* d = has_x1 && has_y1 ? img.px(2 * x + 1, 2 * y + 1) : nullptr;
             float* o = out.px(x, y);
-            for (int ch = 0; ch < img.channels; ++ch) o[ch] = 0.25f * (a[ch] + c[ch] + b[ch] + d[ch]);
+            for (int k = 0; k < ch; ++k) {
+                // Same summation order as the reference: a + c + b + d.
+                o[k] = 0.25f * (a[k] + (c ? c[k] : 0.0f) + (b ? b[k] : 0.0f) + (d ? d[k] : 0.0f));
+            }
         }
     });
     return out;
 }
 
-Image upsample_to(const Image& img, int width, int height) {
+namespace {
+
+// Bilinear resize; source coordinate of target pixel i is (i + 0.5) * ratio - 0.5.
+Image resample_bilinear(const Image& img, int width, int height, float ratio_x, float ratio_y) {
     Image out(width, height, img.channels);
     const int w = img.width, h = img.height;
     std::vector<int> x0(static_cast<size_t>(width)), x1(static_cast<size_t>(width));
     std::vector<float> fx(static_cast<size_t>(width));
     for (int x = 0; x < width; ++x) {
-        const float xs = std::clamp((float(x) + 0.5f) * float(w) / float(width) - 0.5f, 0.0f, float(w - 1));
+        const float xs = std::clamp((float(x) + 0.5f) * ratio_x - 0.5f, 0.0f, float(w - 1));
         x0[x] = int(std::floor(xs));
         x1[x] = std::min(x0[x] + 1, w - 1);
         fx[x] = xs - float(x0[x]);
     }
     parallel_rows(height, [&](int y) {
-        const float ys = std::clamp((float(y) + 0.5f) * float(h) / float(height) - 0.5f, 0.0f, float(h - 1));
+        const float ys = std::clamp((float(y) + 0.5f) * ratio_y - 0.5f, 0.0f, float(h - 1));
         const int y0 = int(std::floor(ys));
         const int y1 = std::min(y0 + 1, h - 1);
         const float fy = ys - float(y0);
@@ -177,6 +188,17 @@ Image upsample_to(const Image& img, int width, int height) {
         }
     });
     return out;
+}
+
+}  // namespace
+
+Image upsample_to(const Image& img, int width, int height) {
+    return resample_bilinear(img, width, height, float(img.width) / float(width),
+                             float(img.height) / float(height));
+}
+
+Image upsample_by(const Image& img, int width, int height, int factor) {
+    return resample_bilinear(img, width, height, 1.0f / float(factor), 1.0f / float(factor));
 }
 
 void blur_axis(Image& img, int channel, float sigma, bool vertical) {
@@ -314,8 +336,9 @@ std::vector<TentTaps> tent_taps(int target, int n) {
             tt.w[tt.n++] = w;
         };
         // Taps at -1, 0, +1 source texels around the target's position in
-        // source coordinates, clamped like upsample_to, each read bilinearly.
-        const float base = (float(i) + 0.5f) * float(n) / float(target) - 0.5f;
+        // source coordinates (exactly 2x, the inverse of downsample2),
+        // clamped like upsample_to, each read bilinearly.
+        const float base = (float(i) + 0.5f) * 0.5f - 0.5f;
         for (int d = 0; d < 3; ++d) {
             const float c = std::clamp(base + float(d - 1), 0.0f, float(n - 1));
             const int i0 = int(std::floor(c));
@@ -439,7 +462,7 @@ Image glow_layer(const Image& src, const GlowParams& p, const Image* depth, cons
 
     if (thr.width == 0 || thr.height == 0) return Image(W, H, 3);
 
-    const float scale = float(H) / float(thr.height);
+    const float scale = float(1 << extra);
     const LevelPlan plan = level_plan(p);
     const std::vector<float>& weights = plan.weights;
     const int n = int(weights.size());
@@ -570,7 +593,7 @@ Image glow_layer(const Image& src, const GlowParams& p, const Image* depth, cons
         const Image lvl = contribution(k);
         acc = upsample_tent2_add(acc, lvl.width, lvl.height, &lvl);
     }
-    if (acc.width != W || acc.height != H) acc = upsample_to(acc, W, H);
+    if (acc.width != W || acc.height != H) acc = upsample_by(acc, W, H, 1 << extra);
     if (ac == 3) {
         saturate(acc, p.saturation);
         return acc;

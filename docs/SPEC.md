@@ -41,6 +41,11 @@ suit est notre choix de conception.
    facteur = `max(soft, br - t) / br`.
 3. Pyramide : niveau k à résolution 1/2^k, flou gaussien de σ_k = σ₀·2^k
    (donc σ constant en pixels du niveau : coût quasi indépendant du rayon).
+   Tailles impaires arrondies au-dessus avec des zéros au-delà du bord, et
+   remontée tente à l'échelle exacte 2 : le texel i du niveau k couvre
+   toujours les pixels [2^k·i, 2^k·(i+1)), donc le halo reste centré quelle
+   que soit la taille du buffer (l'hôte doit aligner l'origine du buffer sur
+   un multiple de 2^(n−1) pour qu'il ne bouge pas du tout).
    Octaves continues : n_f = log2(radius / σ₀) + 1, n = ceil(n_f) niveaux ;
    le plus large a σ = radius exactement et son poids est multiplié par
    n_f − (n − 1), pour que le halo grandisse sans saut quand le rayon monte.

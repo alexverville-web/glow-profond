@@ -1,6 +1,7 @@
 // Property tests for the Glow Profond core (no framework, exits non-zero on failure).
 #include <algorithm>
 #include <cmath>
+#include <algorithm>
 #include <cstdio>
 #include <vector>
 
@@ -43,7 +44,7 @@ static void test_downsample_conserves_mean() {
     CHECK(d.width == 4 && d.height == 3);
     CHECK(std::fabs(channel_sum(d, 1) * 4.0 - channel_sum(img, 1)) < 1e-4);
     const Image odd = downsample2(Image(5, 3, 3));
-    CHECK(odd.width == 2 && odd.height == 1);
+    CHECK(odd.width == 3 && odd.height == 2);  // odd sizes round up
 }
 
 static void test_tent_upsample_preserves_constant() {
@@ -115,6 +116,28 @@ static void test_glow_energy_is_exposure() {
     double wsum = 0.0;
     for (float w : level_plan(p).weights) wsum += w;
     CHECK(std::fabs(channel_sum(g, 1) - 2.0 * wsum) < 0.01 * wsum);
+}
+
+static void test_buffer_size_does_not_move_the_glow() {
+    // A host hands us buffers of varying size around the same layer (the
+    // padding follows the radius). The glow must not drift or turn lopsided.
+    GlowParams p;
+    p.radius = 100.0f;
+    auto glow_in = [&](int size) {
+        Image src(size, size, 3);
+        for (int y = 40; y < 90; ++y)
+            for (int x = 40; x < 90; ++x)
+                for (int c = 0; c < 3; ++c) src.px(x, y)[c] = 1.0f;
+        return glow_layer(src, p);
+    };
+    const Image a = glow_in(257), b = glow_in(300);
+    // Only the clamped far edges differ (within a coarse texel of them).
+    float worst = 0.0f;
+    for (int y = 0; y < 128; ++y)
+        for (int x = 0; x < 128; ++x) worst = std::max(worst, std::fabs(a.px(x, y)[0] - b.px(x, y)[0]));
+    CHECK(worst < 0.01f * a.px(30, 65)[0]);
+    // And it is centred: same glow left and right of the square.
+    CHECK(std::fabs(a.px(30, 65)[0] - a.px(99, 65)[0]) < 0.03f * a.px(30, 65)[0]);
 }
 
 static void test_radius_grows_the_halo_smoothly() {
@@ -350,6 +373,7 @@ int main() {
     test_threshold();
     test_level_count();
     test_radius_grows_the_halo_smoothly();
+    test_buffer_size_does_not_move_the_glow();
     test_tonemap_and_srgb();
     test_exposure_off_view_source_is_identity();
     test_glow_energy_is_exposure();
