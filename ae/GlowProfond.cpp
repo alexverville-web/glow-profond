@@ -68,6 +68,12 @@ enum {
     GP_DIRT_LAYER,
     GP_DIRT_AMOUNT,
     GP_DIRT_GROUP_END,
+    GP_DEPTH_GROUP,
+    GP_DEPTH_LAYER,
+    GP_DEPTH_SPREAD,
+    GP_OCCLUSION,
+    GP_DEPTH_INVERT,
+    GP_DEPTH_GROUP_END,
     GP_RENDER_GROUP,
     GP_GAMMA,
     GP_TONEMAP,
@@ -115,7 +121,14 @@ enum {
     ID_DIRT_GROUP,
     ID_DIRT_LAYER,
     ID_DIRT_AMOUNT,
-    ID_DIRT_GROUP_END
+    ID_DIRT_GROUP_END,
+    // v0.3
+    ID_DEPTH_GROUP,
+    ID_DEPTH_LAYER,
+    ID_DEPTH_SPREAD,
+    ID_OCCLUSION,
+    ID_DEPTH_INVERT,
+    ID_DEPTH_GROUP_END
 };
 
 enum { TINT_NONE = 1, TINT_TWO, TINT_THREE };
@@ -125,7 +138,7 @@ enum { PRESET_CUSTOM = 1, PRESET_NEON, PRESET_SOFT_SUN, PRESET_CINE, PRESET_ANAM
        PRESET_COUNT = PRESET_SUBTLE };
 
 // Checkout ids for the extra layer requests (distinct from parameter indices).
-enum { CHECKOUT_PREV = 1000, CHECKOUT_NEXT, CHECKOUT_DIRT };
+enum { CHECKOUT_PREV = 1000, CHECKOUT_NEXT, CHECKOUT_DIRT, CHECKOUT_DEPTH };
 
 // What PreRender decided, handed to SmartRender.
 struct RenderPlan {
@@ -135,6 +148,8 @@ struct RenderPlan {
     PF_LRect next_rect;
     bool dirt = false;     // a lens dirt layer was checked out
     PF_LRect dirt_rect;    // in the dirt layer's own space
+    bool depth = false;    // a depth layer was checked out
+    PF_LRect depth_rect;   // in the depth layer's own space
     A_long layer_width;    // effect layer size at render resolution, for the dirt mapping
     A_long layer_height;
 };
@@ -177,14 +192,17 @@ float ToFloat(const PF_ParamDef& def) { return static_cast<float>(def.u.fs_d.val
 
 // Reads every parameter at the current time. Pixel sizes are scaled to the
 // render resolution, so a half-resolution preview matches the full render.
-PF_Err ReadParams(PF_InData* in_data, PF_OutData* out_data, GlowParams& p) {
+// invert_depth, when given, receives the "Inverser la profondeur" checkbox,
+// which is a host-side option (not a GlowParams field).
+PF_Err ReadParams(PF_InData* in_data, PF_OutData* out_data, GlowParams& p, bool* invert_depth = nullptr) {
     PF_Err err = PF_Err_NONE, err2 = PF_Err_NONE;
     static const int kValueParams[] = {GP_RADIUS,    GP_EXPOSURE,  GP_SPREAD,     GP_THRESHOLD,
                                        GP_THRESHOLD_SMOOTH, GP_UNMULT, GP_ASPECT, GP_RADIUS_R,
                                        GP_RADIUS_G,  GP_RADIUS_B,  GP_TINT_MODE,  GP_TINT_CORE,
                                        GP_TINT_MID,  GP_TINT_HALO, GP_GAMMA,      GP_TONEMAP,
                                        GP_BASE_SIGMA, GP_DOWNSAMPLE, GP_VIEW,       GP_SATURATION,
-                                       GP_BLEND,     GP_TEMPORAL,  GP_DIRT_AMOUNT};
+                                       GP_BLEND,     GP_TEMPORAL,  GP_DIRT_AMOUNT, GP_DEPTH_SPREAD,
+                                       GP_OCCLUSION, GP_DEPTH_INVERT};
     PF_ParamDef defs[GP_NUM_PARAMS];
     bool checked_out[GP_NUM_PARAMS] = {};
     for (int index : kValueParams) {
@@ -213,6 +231,10 @@ PF_Err ReadParams(PF_InData* in_data, PF_OutData* out_data, GlowParams& p) {
         p.blend = defs[GP_BLEND].u.pd.value == BLEND_SCREEN ? glow_profond::Blend::Screen : glow_profond::Blend::Add;
         p.temporal_smooth = ToFloat(defs[GP_TEMPORAL]) / 100.0f;
         p.dirt_amount = ToFloat(defs[GP_DIRT_AMOUNT]) / 100.0f;
+        // Only used when a depth layer is set (see SmartRender).
+        p.depth_spread = ToFloat(defs[GP_DEPTH_SPREAD]);
+        p.occlusion = defs[GP_OCCLUSION].u.bd.value != 0;
+        if (invert_depth) *invert_depth = defs[GP_DEPTH_INVERT].u.bd.value != 0;
 
         switch (defs[GP_VIEW].u.pd.value) {
             case VIEW_GLOW: p.view = glow_profond::View::Glow; break;
@@ -282,9 +304,9 @@ PF_Err ReadWorld(PF_PixelFormat format, const PF_EffectWorld* world, Image& img,
     }
 }
 
-// Stretches the dirt texture (tex) over the effect layer, sampled for each
+// Stretches a texture layer (lens dirt, depth) over the effect layer, sampled for each
 // pixel of the work buffer whose top-left is at layer (left, top).
-Image ResampleDirt(const Image& tex, A_long layer_w, A_long layer_h, A_long left, A_long top, int width, int height) {
+Image ResampleLayer(const Image& tex, A_long layer_w, A_long layer_h, A_long left, A_long top, int width, int height) {
     Image out(width, height, 4);
     if (tex.width == 0 || tex.height == 0 || layer_w <= 0 || layer_h <= 0) return out;
     const float sx = float(tex.width) / float(layer_w), sy = float(tex.height) / float(layer_h);
@@ -426,6 +448,20 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data) {
     PF_END_TOPIC(ID_DIRT_GROUP_END);
 
     AEFX_CLR_STRUCT(def);
+    PF_ADD_TOPIC("Profondeur", ID_DEPTH_GROUP);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_LAYER("Calque de profondeur", PF_LayerDefault_NONE, ID_DEPTH_LAYER);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("Etalement selon la profondeur", 0, 1, 0, 1, 0, PF_Precision_HUNDREDTHS, 0, 0,
+                         ID_DEPTH_SPREAD);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_CHECKBOXX("Occlusion", FALSE, 0, ID_OCCLUSION);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_CHECKBOXX("Inverser la profondeur (blanc = proche)", FALSE, 0, ID_DEPTH_INVERT);
+    AEFX_CLR_STRUCT(def);
+    PF_END_TOPIC(ID_DEPTH_GROUP_END);
+
+    AEFX_CLR_STRUCT(def);
     PF_ADD_TOPIC("Rendu", ID_RENDER_GROUP);
     AEFX_CLR_STRUCT(def);
     PF_ADD_CHECKBOXX("Correction gamma", TRUE, 0, ID_GAMMA);
@@ -546,8 +582,8 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
     if (!plan) return PF_Err_OUT_OF_MEMORY;
     plan->input_rect = in_result.result_rect;
     plan->output_rect = extra->output->result_rect;
-    plan->prev_rect = plan->next_rect = plan->dirt_rect = PF_LRect{0, 0, 0, 0};
-    plan->dirt = false;
+    plan->prev_rect = plan->next_rect = plan->dirt_rect = plan->depth_rect = PF_LRect{0, 0, 0, 0};
+    plan->dirt = plan->depth = false;
     plan->layer_width = A_long(std::lround(double(in_data->width) * in_data->downsample_x.num /
                                            std::max<A_long>(in_data->downsample_x.den, 1)));
     plan->layer_height = A_long(std::lround(double(in_data->height) * in_data->downsample_y.num /
@@ -568,18 +604,22 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
             if (!err) *rects[i] = r.result_rect;
         }
     }
-    // Lens dirt: the whole texture layer, stretched over the effect layer.
-    if (!err && glows && p.dirt_amount > 0.0f) {
-        PF_RenderRequest dreq = req;
-        dreq.rect = PF_LRect{0, 0, 30000, 30000};  // clipped by AE to the texture's bounds
+    // Lens dirt and depth: whole layers, stretched over the effect layer.
+    auto checkout_whole = [&](int param, int id, bool& used, PF_LRect& rect) {
+        PF_RenderRequest wreq = req;
+        wreq.rect = PF_LRect{0, 0, 30000, 30000};  // clipped by AE to the layer's bounds
         PF_CheckoutResult r;
         AEFX_CLR_STRUCT(r);
-        err = extra->cb->checkout_layer(in_data->effect_ref, GP_DIRT_LAYER, CHECKOUT_DIRT, &dreq,
-                                        in_data->current_time, in_data->time_step, in_data->time_scale, &r);
+        err = extra->cb->checkout_layer(in_data->effect_ref, param, id, &wreq, in_data->current_time,
+                                        in_data->time_step, in_data->time_scale, &r);
         if (!err && !IsEmpty(r.result_rect)) {
-            plan->dirt = true;
-            plan->dirt_rect = r.result_rect;
+            used = true;
+            rect = r.result_rect;
         }
+    };
+    if (!err && glows && p.dirt_amount > 0.0f) checkout_whole(GP_DIRT_LAYER, CHECKOUT_DIRT, plan->dirt, plan->dirt_rect);
+    if (!err && glows && (p.depth_spread > 0.0f || p.occlusion)) {
+        checkout_whole(GP_DEPTH_LAYER, CHECKOUT_DEPTH, plan->depth, plan->depth_rect);
     }
     if (err) {
         delete plan;
@@ -596,7 +636,8 @@ PF_Err SmartRender(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra
     if (!plan) return PF_Err_BAD_CALLBACK_PARAM;
 
     GlowParams p;
-    ERR(ReadParams(in_data, out_data, p));
+    bool invert_depth = false;
+    ERR(ReadParams(in_data, out_data, p, &invert_depth));
 
     PF_EffectWorld* input = nullptr;
     PF_EffectWorld* output = nullptr;
@@ -656,6 +697,36 @@ PF_Err SmartRender(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra
                 }
                 if (w) ERR2(extra->cb->checkin_layer_pixels(in_data->effect_ref, CHECKOUT_PREV + i));
             }
+            if (!plan->depth) {
+                // No depth layer: the depth controls do nothing.
+                p.depth_spread = 0.0f;
+                p.occlusion = false;
+            }
+            Image depth;
+            if (!err && plan->depth) {
+                PF_EffectWorld* w = nullptr;
+                ERR(extra->cb->checkout_layer_pixels(in_data->effect_ref, CHECKOUT_DEPTH, &w));
+                if (!err && w && w->data) {
+                    Image tex(int(w->width), int(w->height), 4);
+                    ERR(ReadWorld(format, w, tex, 0, 0));
+                    if (!err) {
+                        // The core reads red, straight, 0 = near. AE hands us
+                        // premultiplied pixels; many Z passes are white = near.
+                        // Transparent areas of the depth layer count as far.
+                        for (size_t i = 0; i < tex.data.size(); i += 4) {
+                            const float a = tex.data[i + 3];
+                            float z = a > 0.0f ? tex.data[i] / a : 1.0f;
+                            if (invert_depth && a > 0.0f) z = 1.0f - z;
+                            tex.data[i] = tex.data[i + 1] = tex.data[i + 2] = z;
+                            tex.data[i + 3] = 1.0f;
+                        }
+                        depth = ResampleLayer(tex, plan->layer_width, plan->layer_height, bounds.left, bounds.top,
+                                             src.width, src.height);
+                        inputs.depth = &depth;
+                    }
+                }
+                if (w) ERR2(extra->cb->checkin_layer_pixels(in_data->effect_ref, CHECKOUT_DEPTH));
+            }
             if (!err && plan->dirt) {
                 PF_EffectWorld* w = nullptr;
                 ERR(extra->cb->checkout_layer_pixels(in_data->effect_ref, CHECKOUT_DIRT, &w));
@@ -663,7 +734,7 @@ PF_Err SmartRender(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra
                     Image tex(int(w->width), int(w->height), 4);
                     ERR(ReadWorld(format, w, tex, 0, 0));
                     if (!err) {
-                        dirt = ResampleDirt(tex, plan->layer_width, plan->layer_height, bounds.left, bounds.top,
+                        dirt = ResampleLayer(tex, plan->layer_width, plan->layer_height, bounds.left, bounds.top,
                                             src.width, src.height);
                         inputs.dirt = &dirt;
                     }

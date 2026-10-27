@@ -51,13 +51,17 @@ Profond**.
 | Forme › Rayon rouge / vert / bleu | `rgb_radius` |
 | Teinte › Mode, couleurs cœur / milieu / halo | `tint` (1, 2 ou 3 couleurs) |
 | Saleté de lentille › Texture, Intensité saleté | `GlowInputs::dirt` (calque étiré sur le calque de l'effet), `dirt_amount` (%) |
+| Profondeur › Calque de profondeur | `GlowInputs::depth` (canal rouge, 0 = proche, 1 = loin ; étiré sur le calque ; zones transparentes = loin). Sans calque, tout le groupe est ignoré |
+| Profondeur › Étalement selon la profondeur | `depth_spread` (0 à 1 : les sources lointaines diffusent plus large) |
+| Profondeur › Occlusion | `occlusion` (les pixels plus proches masquent le glow des sources plus lointaines) |
+| Profondeur › Inverser la profondeur | option du wrapper : `1 − rouge`, pour les passes Z où le blanc est proche |
 | Rendu › Correction gamma | `gamma_correct` (à couper dans un projet linéaire 32 bpc) |
 | Rendu › Tonemap ACES | `tonemap` |
 | Rendu › Sigma de base, Qualité | `base_sigma`, `downsample` (Maximale 1x … Brouillon 8x) |
 | Affichage | `view` : Résultat final, Glow seul, Source, Glow derrière (le glow passe sous le calque) |
 
 Les nouveaux paramètres ont des identifiants disque ajoutés en fin de liste :
-les projets enregistrés avec la v0.1 s'ouvrent toujours.
+les projets enregistrés avec les versions précédentes s'ouvrent toujours.
 
 Les tailles en pixels (rayon, sigma de base) suivent la résolution de
 l'aperçu : un aperçu en demi-résolution garde le même look.
