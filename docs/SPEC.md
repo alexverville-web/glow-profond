@@ -19,7 +19,7 @@ Ce que la documentation publique affirme (observé) :
 | --- | --- |
 | Falloff « physiquement exact » en inverse du carré | Somme de gaussiennes par octave, poids égaux (voir plus bas) |
 | Correction gamma, résultat linéaire même en espace non linéaire | `gamma_correct` : décodage sRGB → glow → réencodage |
-| Seuil HDR avec lissage (moins de scintillement) | `threshold` + `threshold_smooth` (soft knee) |
+| Seuil HDR avec lissage (moins de scintillement) | `threshold` + `threshold_smooth` (genou relatif au seuil, 0 à 1) |
 | Spread, rayon, aspect ratio variable | `spread` (exposant p), `radius`, `aspect` |
 | Aberration chromatique, multiplicateurs de rayon RGB | `rgb_radius` (σ par canal) |
 | Teinte multicolore | `tint` : dégradé de couleurs du cœur vers le halo |
