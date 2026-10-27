@@ -1,0 +1,130 @@
+// Compares the Metal glow with the CPU core on the same input (the plain
+// path: no depth, no lens dirt), and times both. Exit code 1 if any case differs by more than the tolerance.
+//   glow_metal_test [--bench]
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "GlowMetal.h"
+
+using glow_profond::GlowParams;
+using glow_profond::Image;
+
+namespace {
+
+constexpr float kTolerance = 1e-3f;
+
+// Linear-light test frame: a soft gradient, hot spots and thin lines, so
+// thresholds, odd sizes and every pyramid level get exercised.
+Image scene(int w, int h) {
+    Image img(w, h, 3);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            float* o = img.px(x, y);
+            const float g = 0.05f + 0.1f * float(x) / float(w);
+            o[0] = g;
+            o[1] = g * 0.8f;
+            o[2] = g * 0.6f;
+            if (((x / 97) + (y / 61)) % 9 == 0) {
+                o[0] = 4.0f;
+                o[1] = 2.0f;
+                o[2] = 0.5f;
+            }
+            if (y % 211 == 7) o[2] = 3.0f;
+        }
+    }
+    return img;
+}
+
+double ms_since(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    const bool bench = argc > 1 && std::strcmp(argv[1], "--bench") == 0;
+    std::string error;
+    auto gpu = glow_profond::metal::GlowMetal::create(&error);
+    if (!gpu) {
+        std::printf("Metal unavailable: %s\n", error.c_str());
+        return 1;
+    }
+
+    struct Case {
+        const char* name;
+        GlowParams p;
+    };
+    std::vector<Case> cases;
+    auto add = [&](const char* name, auto&& tweak) {
+        GlowParams p;
+        p.radius = 200.0f;
+        tweak(p);
+        cases.push_back({name, p});
+    };
+    add("default", [](GlowParams&) {});
+    add("radius_400", [](GlowParams& p) { p.radius = 400.0f; });
+    add("tiny_radius", [](GlowParams& p) { p.radius = 1.0f; });
+    add("spread_3_exposure", [](GlowParams& p) { p.spread = 3.0f; p.exposure = 1.5f; });
+    add("anamorphic", [](GlowParams& p) { p.aspect = 6.0f; });
+    add("chromatic", [](GlowParams& p) { p.rgb_radius = {1.4f, 1.0f, 0.7f}; });
+    add("multitint", [](GlowParams& p) { p.tint = {{1, 1, 1}, {1, 0.4f, 0.8f}, {0.3f, 0.3f, 1}}; });
+    add("threshold", [](GlowParams& p) { p.threshold = 1.0f; p.threshold_smooth = 0.2f; });
+    add("downsample_2", [](GlowParams& p) { p.downsample = 2; });
+    add("downsample_8", [](GlowParams& p) { p.downsample = 8; p.radius = 600.0f; });
+    add("wide_base_sigma", [](GlowParams& p) { p.base_sigma = 8.0f; p.aspect = 10.0f; p.rgb_radius = {4, 1, 1}; });
+    add("saturation", [](GlowParams& p) { p.saturation = 1.8f; });
+    add("desaturated", [](GlowParams& p) { p.saturation = 0.0f; });
+    add("downsample_sat", [](GlowParams& p) { p.downsample = 4; p.saturation = 0.5f; });
+    // Without a depth or dirt image these must be no-ops, like on the CPU.
+    add("depth_dirt_unset", [](GlowParams& p) { p.depth_spread = 1.0f; p.occlusion = true; p.dirt_amount = 1.0f; });
+
+    int failures = 0;
+    const int sizes[][2] = {{641, 359}, {1920, 1080}};
+    for (const auto& sz : sizes) {
+        const Image src = scene(sz[0], sz[1]);
+        for (const Case& c : cases) {
+            const Image ref = glow_profond::glow_layer(src, c.p);
+            Image out;
+            if (!gpu->glow_layer(src, c.p, out)) {
+                std::printf("FAIL %-18s %dx%d: Metal run failed\n", c.name, sz[0], sz[1]);
+                ++failures;
+                continue;
+            }
+            float max_diff = 0.0f, max_val = 0.0f;
+            for (size_t i = 0; i < ref.data.size(); ++i) {
+                max_diff = std::max(max_diff, std::fabs(ref.data[i] - out.data[i]));
+                max_val = std::max(max_val, std::fabs(ref.data[i]));
+            }
+            const bool ok = max_diff <= kTolerance;
+            failures += !ok;
+            std::printf("%s %-18s %4dx%-4d max|diff| = %.2e (max value %.2f)\n", ok ? "ok  " : "FAIL", c.name, sz[0],
+                        sz[1], max_diff, max_val);
+        }
+    }
+
+    if (bench) {
+        const int bsizes[][2] = {{1920, 1080}, {3840, 2160}};
+        for (const auto& sz : bsizes) {
+            const Image src = scene(sz[0], sz[1]);
+            GlowParams p;  // radius 400, the plug-in default
+            double cpu = 1e9, gpu_ms = 1e9, total = 1e9;
+            for (int i = 0; i < 5; ++i) {
+                const auto t0 = std::chrono::steady_clock::now();
+                const Image ref = glow_profond::glow_layer(src, p);
+                cpu = std::min(cpu, ms_since(t0));
+                Image out;
+                glow_profond::metal::Timing t;
+                gpu->glow_layer(src, p, out, &t);
+                gpu_ms = std::min(gpu_ms, t.gpu_ms);
+                total = std::min(total, t.total_ms);
+            }
+            std::printf("bench %dx%d radius 400: CPU glow_layer %.1f ms | Metal GPU %.1f ms (%.1f ms with upload/readback)\n",
+                        sz[0], sz[1], cpu, gpu_ms, total);
+        }
+    }
+    return failures ? 1 : 0;
+}
