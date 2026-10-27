@@ -278,18 +278,25 @@ A_long GlowPadding(const GlowParams& p) {
 
 // Copies world into img at (dx, dy); whatever falls outside img is dropped
 // (neighbouring frames can cover a different rect than the current one).
+// Integer worlds get colour <= alpha: AE can hand over edge pixels with full
+// colour and almost no alpha (seen on a shape layer's stroke join in 16 bpc),
+// and dividing by that alpha turned them into blinding lights. A straight
+// 8/16-bit colour can't exceed 1, so the clamp only removes the bad pixels;
+// float worlds keep HDR values as they are.
 template <class Pixel>
 void ReadPixels(const PF_EffectWorld* world, float max_value, Image& img, int dx, int dy) {
+    const bool clamp_premult = max_value > 1.0f;
     const int x_lo = std::max(0, -dx), x_hi = std::min(int(world->width), img.width - dx);
     glow_profond::parallel_for_rows(int(world->height), [&](int y) {
         if (y + dy < 0 || y + dy >= img.height) return;
         const Pixel* row = reinterpret_cast<const Pixel*>(reinterpret_cast<const char*>(world->data) + y * world->rowbytes);
         for (int x = x_lo; x < x_hi; ++x) {
             float* o = img.px(x + dx, y + dy);
-            o[0] = float(row[x].red) / max_value;
-            o[1] = float(row[x].green) / max_value;
-            o[2] = float(row[x].blue) / max_value;
             o[3] = float(row[x].alpha) / max_value;
+            const float cap = clamp_premult ? o[3] : 1e30f;
+            o[0] = std::min(float(row[x].red) / max_value, cap);
+            o[1] = std::min(float(row[x].green) / max_value, cap);
+            o[2] = std::min(float(row[x].blue) / max_value, cap);
         }
     });
 }

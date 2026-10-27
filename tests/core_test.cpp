@@ -1,4 +1,5 @@
 // Property tests for the Glow Profond core (no framework, exits non-zero on failure).
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 
@@ -277,7 +278,39 @@ static void test_behind_keeps_opaque_pixels() {
     CHECK(out.px(40, 32)[3] > 0.0f && out.px(40, 32)[0] > 0.0f);
 }
 
+static void test_transparent_layer_over_black_matches_opaque() {
+    // A white shape on a transparent layer, composited over black (premult
+    // colour as is), must look like render() of the same shape on opaque
+    // black. The old encoding kept the glow linear in alpha: the wide halo
+    // vanished in After Effects.
+    const int W = 160, H = 96;
+    Image rgba(W, H, 4), rgb(W, H, 3);
+    for (int y = 30; y < 60; ++y)
+        for (int x = 40; x < 80; ++x) {
+            for (int c = 0; c < 4; ++c) rgba.px(x, y)[c] = 1.0f;
+            for (int c = 0; c < 3; ++c) rgb.px(x, y)[c] = 1.0f;
+        }
+    for (int tonemap = 0; tonemap < 2; ++tonemap) {
+        GlowParams p;
+        p.radius = 60.0f;
+        p.tonemap = tonemap != 0;
+        const Image a = render(rgb, p);
+        const Image b = render_premultiplied(rgba, p);
+        float worst = 0.0f;
+        int invalid = 0;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                for (int c = 0; c < 3; ++c) worst = std::max(worst, std::fabs(a.px(x, y)[c] - b.px(x, y)[c]));
+                // Valid premultiplied pixel wherever it isn't opaque (opaque HDR may exceed 1).
+                if (b.px(x, y)[3] < 1.0f) invalid += b.px(x, y)[0] > b.px(x, y)[3] + 1e-6f;
+            }
+        CHECK(worst < 1e-5f);
+        CHECK(invalid == 0);
+    }
+}
+
 int main() {
+    test_transparent_layer_over_black_matches_opaque();
     test_screen_composite();
     test_depth_spread_widens_far_sources();
     test_occlusion_masks_far_glow_on_near_pixels();

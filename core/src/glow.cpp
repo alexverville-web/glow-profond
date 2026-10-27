@@ -726,34 +726,48 @@ Image render_premultiplied(const Image& src, const GlowParams& p, const GlowInpu
                           dirt_lin.data.empty() ? nullptr : &dirt_lin);
     }
 
+    // Linear light -> output encoding (tonemap, then sRGB when gamma_correct).
+    auto encode = [&](float v) {
+        if (p.tonemap) v = aces_fitted(v);
+        if (p.gamma_correct) v = linear_to_srgb(v);
+        return v;
+    };
     Image out(W, H, 4);
     parallel_rows(H, [&](int y) {
         for (int x = 0; x < W; ++x) {
             const float* l = lin.px(x, y);
             float* o = out.px(x, y);
-            float a = alpha[size_t(y) * W + x];
-            float premult[3] = {l[0], l[1], l[2]};
-            if (p.view != View::Source) {
-                const float* g = glow.px(x, y);
-                const float coverage = std::clamp(std::max({g[0], g[1], g[2]}), 0.0f, 1.0f);
-                if (p.view == View::Glow) {
-                    for (int c = 0; c < 3; ++c) premult[c] = g[c];
-                    a = coverage;
-                } else {
-                    // Behind: the glow passes under the layer, through its transparency.
-                    const float under = p.view == View::Behind ? 1.0f - a : 1.0f;
-                    for (int c = 0; c < 3; ++c) premult[c] = composite(premult[c], under * g[c], p.blend);
-                    a = a + (1.0f - a) * coverage;  // glow extends the layer's coverage
-                }
+            const float a = alpha[size_t(y) * W + x];
+            // The source keeps its usual encoding: straight colour encoded,
+            // premultiplied again. Semi-transparent edges are unchanged.
+            float src_enc[3];
+            for (int c = 0; c < 3; ++c) src_enc[c] = a > 0.0f ? encode(l[c] / a) * a : 0.0f;
+            if (p.view == View::Source) {
+                for (int c = 0; c < 3; ++c) o[c] = src_enc[c];
+                o[3] = a;
+                continue;
             }
-            // Tonemap and encode straight colour, then premultiply again.
+            // The glow is light added over the layer, so it is encoded as it
+            // looks over black: encode(source + glow) - encode(source). The
+            // old version kept it linear and put its linear value in alpha,
+            // so a wide halo (linear 0.005) came out at 1/255: invisible.
+            const float* g = glow.px(x, y);
+            const bool glow_only = p.view == View::Glow;
+            // Behind: the glow passes under the layer, through its transparency.
+            const float under = p.view == View::Behind ? 1.0f - a : 1.0f;
+            float rgb[3], peak = 0.0f;
             for (int c = 0; c < 3; ++c) {
-                float v = a > 0.0f ? premult[c] / a : 0.0f;
-                if (p.tonemap) v = aces_fitted(v);
-                if (p.gamma_correct) v = linear_to_srgb(v);
-                o[c] = v * a;
+                const float base = glow_only ? 0.0f : l[c];
+                const float total = glow_only ? g[c] : composite(l[c], under * g[c], p.blend);
+                const float added = std::max(encode(total) - encode(base), 0.0f);
+                rgb[c] = (glow_only ? 0.0f : src_enc[c]) + added;
+                peak = std::max(peak, rgb[c]);
             }
-            o[3] = a;
+            // Coverage: enough alpha for the colour to stay premultiplied
+            // (colour <= alpha up to 1), so over black it shows exactly rgb.
+            const float base_alpha = glow_only ? 0.0f : a;
+            for (int c = 0; c < 3; ++c) o[c] = rgb[c];
+            o[3] = std::max(base_alpha, std::min(peak, 1.0f));
         }
     });
     return out;
