@@ -44,6 +44,13 @@ static void test_downsample_conserves_mean() {
     CHECK(odd.width == 2 && odd.height == 1);
 }
 
+static void test_tent_upsample_preserves_constant() {
+    Image img(7, 5, 3);
+    for (float& v : img.data) v = 0.7f;
+    const Image up = upsample_tent2(img, 15, 11);  // odd target sizes
+    for (float v : up.data) CHECK(std::fabs(v - 0.7f) < 1e-6f);
+}
+
 static void test_threshold() {
     Image img(3, 1, 3);
     img.px(0, 0)[0] = 0.1f;   // well below t - knee
@@ -143,6 +150,7 @@ int main() {
     test_premultiplied_glow_extends_alpha();
     test_blur_conserves_energy();
     test_downsample_conserves_mean();
+    test_tent_upsample_preserves_constant();
     test_threshold();
     test_level_count();
     test_tonemap_and_srgb();

@@ -66,6 +66,7 @@ Image render_premultiplied(const Image& src, const GlowParams& p);
 Image soft_threshold(const Image& rgb, float t, float smooth);
 Image downsample2(const Image& img);
 Image upsample_to(const Image& img, int width, int height);
+Image upsample_tent2(const Image& img, int width, int height);
 void blur_axis(Image& img, int channel, float sigma, bool vertical);
 float srgb_to_linear(float x);
 float linear_to_srgb(float x);

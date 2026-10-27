@@ -30,3 +30,7 @@ ctest --test-dir build --output-on-failure   # parité : numpy requis
 Le test de parité rend la scène de `reference/demo.py` avec chaque preset dans
 les deux implémentations et exige un écart maximal de 2e-4 (actuellement
 ~2e-7).
+
+`glowprofond … --bench 3` affiche le temps de rendu : environ 1,5 s pour une
+image 3840×2160 avec un rayon de 400 sur 4 cœurs, contre environ 4 s avant
+la cascade tente.

@@ -3,11 +3,16 @@
 #include "glow_profond/glow.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <thread>
 
 namespace glow_profond {
 namespace {
+
+// Variance (in source texels, per axis) that one 2x tent upsample adds:
+// tent taps at +-1 (0.5) plus the bilinear split at +-0.25 texel (0.1875).
+constexpr float kTentStepVariance = 0.6875f;
 
 // Runs fn(row) for every row in [0, rows), split across hardware threads.
 template <class Fn>
@@ -158,6 +163,150 @@ void blur_axis(Image& img, int channel, float sigma, bool vertical) {
     });
 }
 
+namespace {
+
+// Separable Gaussian on the three channels of a level, both axes, with one
+// scratch copy per axis. Same arithmetic as blur_axis (zero padding, same
+// summation order), so results match it bit for bit.
+void blur_level(Image& img, const float (&sx)[3], const float (&sy)[3]) {
+    const int W = img.width, H = img.height, ch = img.channels;
+    std::vector<float> kx[3], ky[3];
+    bool any_x = false, any_y = false;
+    for (int c = 0; c < 3; ++c) {
+        if (sx[c] >= 0.3f) { kx[c] = gauss_kernel(sx[c]); any_x = true; }
+        if (sy[c] >= 0.3f) { ky[c] = gauss_kernel(sy[c]); any_y = true; }
+    }
+    if (any_x) {
+        const std::vector<float> src(img.data);
+        parallel_rows(H, [&](int y) {
+            const float* row = src.data() + size_t(y) * W * ch;
+            float* out = img.data.data() + size_t(y) * W * ch;
+            for (int c = 0; c < 3; ++c) {
+                if (kx[c].empty()) continue;
+                const float* k = kx[c].data();
+                const int r = int(kx[c].size()) / 2;
+                for (int i = 0; i < W; ++i) {
+                    float acc = 0.0f;
+                    const int lo = std::max(0, i - r), hi = std::min(W - 1, i + r);
+                    for (int j = lo; j <= hi; ++j) acc += k[j - i + r] * row[size_t(j) * ch + c];
+                    out[size_t(i) * ch + c] = acc;
+                }
+            }
+        });
+    }
+    if (any_y) {
+        const std::vector<float> src(img.data);
+        // Row-major traversal: output row i gathers whole input rows, which
+        // keeps memory access sequential (columns would thrash the cache).
+        parallel_rows(H, [&](int i) {
+            float* out = img.data.data() + size_t(i) * W * ch;
+            for (int c = 0; c < 3; ++c) {
+                if (ky[c].empty()) continue;
+                const float* k = ky[c].data();
+                const int r = int(ky[c].size()) / 2;
+                const int lo = std::max(0, i - r), hi = std::min(H - 1, i + r);
+                for (int x = 0; x < W; ++x) out[size_t(x) * ch + c] = 0.0f;
+                for (int j = lo; j <= hi; ++j) {
+                    const float kj = k[j - i + r];
+                    const float* row = src.data() + size_t(j) * W * ch;
+                    for (int x = 0; x < W; ++x) out[size_t(x) * ch + c] += kj * row[size_t(x) * ch + c];
+                }
+            }
+        });
+    }
+}
+
+// acc += gain * upsample_to(img, acc size), without materializing the
+// upsampled image. Same interpolation arithmetic as upsample_to.
+void accumulate_upsampled(Image& acc, const Image& img, const Rgb& gain) {
+    const int width = acc.width, height = acc.height;
+    const int w = img.width, h = img.height;
+    std::vector<int> x0(static_cast<size_t>(width)), x1(static_cast<size_t>(width));
+    std::vector<float> fx(static_cast<size_t>(width));
+    for (int x = 0; x < width; ++x) {
+        const float xs = std::clamp((float(x) + 0.5f) * float(w) / float(width) - 0.5f, 0.0f, float(w - 1));
+        x0[x] = int(std::floor(xs));
+        x1[x] = std::min(x0[x] + 1, w - 1);
+        fx[x] = xs - float(x0[x]);
+    }
+    parallel_rows(height, [&](int y) {
+        const float ys = std::clamp((float(y) + 0.5f) * float(h) / float(height) - 0.5f, 0.0f, float(h - 1));
+        const int y0 = int(std::floor(ys));
+        const int y1 = std::min(y0 + 1, h - 1);
+        const float fy = ys - float(y0);
+        for (int x = 0; x < width; ++x) {
+            const float* p00 = img.px(x0[x], y0);
+            const float* p01 = img.px(x1[x], y0);
+            const float* p10 = img.px(x0[x], y1);
+            const float* p11 = img.px(x1[x], y1);
+            float* a = acc.px(x, y);
+            for (int c = 0; c < 3; ++c) {
+                const float top = p00[c] * (1.0f - fx[x]) + p01[c] * fx[x];
+                const float bot = p10[c] * (1.0f - fx[x]) + p11[c] * fx[x];
+                a[c] += gain[c] * (top * (1.0f - fy) + bot * fy);
+            }
+        }
+    });
+}
+
+}  // namespace
+
+Image upsample_tent2(const Image& img, int width, int height) {
+    struct Tap {
+        int i0, i1;
+        float f;
+    };
+    // Three taps (-1, 0, +1 source texels) per target coordinate, clamped
+    // like upsample_to, each read bilinearly.
+    auto taps = [](int target, int n) {
+        std::vector<std::array<Tap, 3>> t(static_cast<size_t>(target));
+        for (int i = 0; i < target; ++i) {
+            const float base = (float(i) + 0.5f) * float(n) / float(target) - 0.5f;
+            for (int d = 0; d < 3; ++d) {
+                const float c = std::clamp(base + float(d - 1), 0.0f, float(n - 1));
+                const int i0 = int(std::floor(c));
+                t[i][d] = {i0, std::min(i0 + 1, n - 1), c - float(i0)};
+            }
+        }
+        return t;
+    };
+    static const float kTent[3] = {0.25f, 0.5f, 0.25f};
+    const int ch = img.channels;
+    const auto tx = taps(width, img.width);
+    const auto ty = taps(height, img.height);
+
+    // Along x first (source rows, target width), then along y.
+    Image rows(width, img.height, ch);
+    parallel_rows(img.height, [&](int y) {
+        for (int x = 0; x < width; ++x) {
+            float* o = rows.px(x, y);
+            for (int c = 0; c < ch; ++c) {
+                float sum = 0.0f;
+                for (int d = 0; d < 3; ++d) {
+                    const Tap& t = tx[x][d];
+                    sum += kTent[d] * (img.px(t.i0, y)[c] * (1.0f - t.f) + img.px(t.i1, y)[c] * t.f);
+                }
+                o[c] = sum;
+            }
+        }
+    });
+    Image out(width, height, ch);
+    parallel_rows(height, [&](int y) {
+        for (int x = 0; x < width; ++x) {
+            float* o = out.px(x, y);
+            for (int c = 0; c < ch; ++c) {
+                float sum = 0.0f;
+                for (int d = 0; d < 3; ++d) {
+                    const Tap& t = ty[y][d];
+                    sum += kTent[d] * (rows.px(x, t.i0)[c] * (1.0f - t.f) + rows.px(x, t.i1)[c] * t.f);
+                }
+                o[c] = sum;
+            }
+        }
+    });
+    return out;
+}
+
 int level_count(const GlowParams& p) {
     const float ratio = std::max(p.radius / p.base_sigma, 1.0f);
     return std::max(1, int(std::floor(std::log2(ratio))) + 1);
@@ -183,28 +332,53 @@ Image glow_layer(const Image& src, const GlowParams& p) {
     for (float& w : weights) w /= wsum;
 
     const float ax = std::sqrt(p.aspect), ay = 1.0f / std::sqrt(p.aspect);
-    Image level = img;
-    for (int k = 0; k < n; ++k) {
-        if (k > 0) level = downsample2(level);  // level k lives at 1 / 2^k resolution
-        if (level.width == 0 || level.height == 0) break;
-        const float lvl_scale = scale * std::pow(2.0f, float(k));
-        const float sigma_level = p.base_sigma * std::pow(2.0f, float(k)) / lvl_scale;
-        Image blurred = level;
+    const float sigma_level = p.base_sigma / scale;  // same in every level's own pixels
+    std::vector<Image> levels;
+    levels.push_back(std::move(img));
+    for (int k = 1; k < n; ++k) {
+        Image next = downsample2(levels.back());
+        if (next.width == 0 || next.height == 0) break;  // tiny images: fewer levels
+        levels.push_back(std::move(next));
+    }
+    const int used = int(levels.size());
+
+    // Blur level k in place and scale it by its weight and tint. The blur is
+    // shrunk by the variance its upsample chain adds back, so the effective
+    // sigma stays base_sigma * 2^k.
+    auto blur_weighted = [&](int k) {
+        const float extra = kTentStepVariance * (4.0f / 3.0f) * (1.0f - std::pow(4.0f, -float(k)));
+        float sx[3], sy[3];
         for (int c = 0; c < 3; ++c) {
             const float s = sigma_level * p.rgb_radius[c];
-            blur_axis(blurred, c, s * ax, false);
-            blur_axis(blurred, c, s * ay, true);
+            sx[c] = std::sqrt(std::max((s * ax) * (s * ax) - extra, 0.0f));
+            sy[c] = std::sqrt(std::max((s * ay) * (s * ay) - extra, 0.0f));
         }
-        const Image up = upsample_to(blurred, W, H);
+        Image& lvl = levels[size_t(k)];
+        blur_level(lvl, sx, sy);
         const Rgb tint = tint_for_level(p.tint, k, n);
-        const float wk = weights[k];
-        parallel_rows(H, [&](int y) {
-            for (int x = 0; x < W; ++x) {
-                const float* u = up.px(x, y);
-                float* a = acc.px(x, y);
-                for (int c = 0; c < 3; ++c) a[c] += wk * tint[c] * u[c];
+        Rgb gain;
+        for (int c = 0; c < 3; ++c) gain[c] = weights[k] * tint[c];
+        parallel_rows(lvl.height, [&](int y) {
+            for (int x = 0; x < lvl.width; ++x) {
+                float* v = lvl.px(x, y);
+                for (int c = 0; c < 3; ++c) v[c] = gain[c] * v[c];
             }
         });
+    };
+
+    blur_weighted(used - 1);
+    Image cascade = std::move(levels[size_t(used - 1)]);
+    for (int k = used - 2; k >= 0; --k) {
+        blur_weighted(k);
+        Image up = upsample_tent2(cascade, levels[size_t(k)].width, levels[size_t(k)].height);
+        const Image& lvl = levels[size_t(k)];
+        for (size_t i = 0; i < up.data.size(); ++i) up.data[i] += lvl.data[i];
+        cascade = std::move(up);
+    }
+    if (cascade.width == W && cascade.height == H) {
+        acc = std::move(cascade);
+    } else {
+        accumulate_upsampled(acc, cascade, {1.0f, 1.0f, 1.0f});
     }
     const float gain = std::pow(2.0f, p.exposure);
     for (float& v : acc.data) v *= gain;
@@ -214,7 +388,7 @@ Image glow_layer(const Image& src, const GlowParams& p) {
 Image render(const Image& src, const GlowParams& p) {
     const int W = src.width, H = src.height;
     Image lin(W, H, 3);
-    for (int y = 0; y < H; ++y) {
+    parallel_rows(H, [&](int y) {
         for (int x = 0; x < W; ++x) {
             const float* s = src.px(x, y);
             float rgb[3] = {s[0], s[1], s[2]};
@@ -226,7 +400,7 @@ Image render(const Image& src, const GlowParams& p) {
             float* o = lin.px(x, y);
             for (int c = 0; c < 3; ++c) o[c] = (p.gamma_correct ? srgb_to_linear(rgb[c]) : rgb[c]) * alpha;
         }
-    }
+    });
 
     Image out = lin;
     if (p.view != View::Source) {
@@ -237,10 +411,13 @@ Image render(const Image& src, const GlowParams& p) {
             for (size_t i = 0; i < out.data.size(); ++i) out.data[i] += g.data[i];
         }
     }
-    for (float& v : out.data) {
-        if (p.tonemap) v = aces_fitted(v);
-        if (p.gamma_correct) v = linear_to_srgb(v);
-    }
+    parallel_rows(H, [&](int y) {
+        float* row = out.px(0, y);
+        for (int i = 0; i < W * 3; ++i) {
+            if (p.tonemap) row[i] = aces_fitted(row[i]);
+            if (p.gamma_correct) row[i] = linear_to_srgb(row[i]);
+        }
+    });
     return out;
 }
 
@@ -248,7 +425,7 @@ Image render_premultiplied(const Image& src, const GlowParams& p) {
     const int W = src.width, H = src.height;
     Image lin(W, H, 3);
     std::vector<float> alpha(size_t(W) * H);
-    for (int y = 0; y < H; ++y) {
+    parallel_rows(H, [&](int y) {
         for (int x = 0; x < W; ++x) {
             const float* s = src.px(x, y);
             float a = s[3];
@@ -265,7 +442,7 @@ Image render_premultiplied(const Image& src, const GlowParams& p) {
             float* o = lin.px(x, y);
             for (int c = 0; c < 3; ++c) o[c] = (p.gamma_correct ? srgb_to_linear(rgb[c]) : rgb[c]) * a;
         }
-    }
+    });
 
     Image glow;
     if (p.view != View::Source) glow = glow_layer(lin, p);

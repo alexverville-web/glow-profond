@@ -4,6 +4,7 @@
 //
 // Reads PNG/JPG/TGA/BMP/HDR (via stb) or PFM; writes PNG or PFM (float).
 // 8-bit inputs are read as 0..1 values in the comp's working space.
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -119,7 +120,8 @@ int usage() {
                  "  --base-sigma F        tightest level sigma (1.5)\n"
                  "  --downsample N        extra global downsample, power of two (1)\n"
                  "  --view final|glow|source\n"
-                 "  --unmult  --tonemap  --linear (disable gamma correction)\n";
+                 "  --unmult  --tonemap  --linear (disable gamma correction)\n"
+                 "  --bench N             time N renders and print the average\n";
     return 2;
 }
 
@@ -130,6 +132,7 @@ int main(int argc, char** argv) {
     const std::string in = argv[1], out = argv[2];
     GlowParams p;
     bool tint_set = false;
+    int bench = 0;
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
         const bool has_value = i + 1 < argc;
@@ -152,7 +155,8 @@ int main(int argc, char** argv) {
             p.view = v == "glow" ? glow_profond::View::Glow
                    : v == "source" ? glow_profond::View::Source
                                    : glow_profond::View::Final;
-        } else if (a == "--unmult") p.unmult = true;
+        } else if (a == "--bench" && has_value) bench = std::atoi(next());
+        else if (a == "--unmult") p.unmult = true;
         else if (a == "--tonemap") p.tonemap = true;
         else if (a == "--linear") p.gamma_correct = false;
         else return usage();
@@ -162,6 +166,12 @@ int main(int argc, char** argv) {
     if (!read_image(in, src)) {
         std::cerr << "cannot read " << in << "\n";
         return 1;
+    }
+    for (int i = 0; i < bench; ++i) {
+        const auto t0 = std::chrono::steady_clock::now();
+        glow_profond::render(src, p);
+        const std::chrono::duration<double, std::milli> dt = std::chrono::steady_clock::now() - t0;
+        std::cout << "render " << src.width << "x" << src.height << ": " << dt.count() << " ms\n";
     }
     const Image result = glow_profond::render(src, p);
     if (!write_image(out, result)) {
