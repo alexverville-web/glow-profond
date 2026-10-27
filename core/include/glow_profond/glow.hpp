@@ -17,6 +17,10 @@ using Rgb = std::array<float, 3>;
 
 enum class View { Final, Glow, Source };
 
+// How the glow is laid over the source. Screen never pushes a channel that
+// is at or below 1 past 1, so whites don't blow out.
+enum class Blend { Add, Screen };
+
 struct GlowParams {
     float radius = 400.0f;           // largest blur sigma, in pixels
     float exposure = 0.0f;           // stops applied to the glow
@@ -32,6 +36,9 @@ struct GlowParams {
     float base_sigma = 1.5f;         // sigma of the tightest level, in pixels
     int downsample = 1;              // extra global downsample (power of two)
     View view = View::Final;
+    Blend blend = Blend::Add;
+    float dirt_amount = 0.0f;        // lens dirt lit by the wide part of the glow
+    float temporal_smooth = 0.0f;    // 0..1, blends neighbouring frames into the glow source
 };
 
 // Planar-free, interleaved image with a fixed channel count.
@@ -52,7 +59,9 @@ struct Image {
 int level_count(const GlowParams& p);
 
 // Glow only, linear light, same size as src (3 channels, premultiplied).
-Image glow_layer(const Image& src_lin_rgb, const GlowParams& p);
+// dirt, when given, is a linear RGB texture of the same size, lit by the wide
+// half of the pyramid and scaled by p.dirt_amount.
+Image glow_layer(const Image& src_lin_rgb, const GlowParams& p, const Image* dirt = nullptr);
 
 // Full effect. src has 3 or 4 channels; returns 3 channels, like the
 // reference render().
@@ -61,7 +70,17 @@ Image render(const Image& src, const GlowParams& p);
 // Host-facing variant for After Effects: src is RGBA premultiplied, and so
 // is the result. The glow widens the alpha coverage so it shows past the
 // layer's edges. For opaque input its RGB equals render().
-Image render_premultiplied(const Image& src, const GlowParams& p);
+//
+// Optional host inputs, all the same size as src and in the same encoding:
+// - dirt: lens dirt texture (RGBA, straight or premultiplied alike);
+// - neighbors: the previous/next frames (RGBA premultiplied), averaged into
+//   the glow source by p.temporal_smooth to calm flickering highlights. The
+//   source itself is still composited from the current frame only.
+struct GlowInputs {
+    const Image* dirt = nullptr;
+    std::vector<const Image*> neighbors;
+};
+Image render_premultiplied(const Image& src, const GlowParams& p, const GlowInputs& inputs = {});
 
 // Runs fn(row) for every row in [0, rows) on all cores (the core's own
 // scheduler, shared with hosts so pixel conversions run in parallel too).

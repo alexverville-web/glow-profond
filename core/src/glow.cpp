@@ -413,7 +413,7 @@ int level_count(const GlowParams& p) {
     return std::max(1, int(std::floor(std::log2(ratio))) + 1);
 }
 
-Image glow_layer(const Image& src, const GlowParams& p) {
+Image glow_layer(const Image& src, const GlowParams& p, const Image* dirt) {
     const int H = src.height, W = src.width;
     Image img = soft_threshold(src, p.threshold, p.threshold_smooth);
     const int extra = int(std::log2(float(std::max(p.downsample, 1))));
@@ -468,16 +468,40 @@ Image glow_layer(const Image& src, const GlowParams& p) {
         });
     };
 
+    // Lens dirt is lit by the wide half of the pyramid: the cascade holds
+    // exactly that sum once it has folded down to level used / 2.
+    const bool want_dirt = dirt && p.dirt_amount > 0.0f;
+    const int dirt_level = used / 2;
+    Image wide;
+
     blur_weighted(used - 1);
     Image cascade = std::move(levels[size_t(used - 1)]);
+    if (want_dirt && dirt_level == used - 1) wide = cascade;
     for (int k = used - 2; k >= 0; --k) {
         blur_weighted(k);
         const Image& lvl = levels[size_t(k)];
         cascade = upsample_tent2_add(cascade, lvl.width, lvl.height, &lvl);
+        if (want_dirt && k == dirt_level) wide = cascade;
     }
-    if (cascade.width == W && cascade.height == H) return cascade;
-    Image acc(W, H, 3);
-    accumulate_upsampled(acc, cascade, {1.0f, 1.0f, 1.0f});
+    Image acc;
+    if (cascade.width == W && cascade.height == H) {
+        acc = std::move(cascade);
+    } else {
+        acc = Image(W, H, 3);
+        accumulate_upsampled(acc, cascade, {1.0f, 1.0f, 1.0f});
+    }
+    if (want_dirt) {
+        Image lit(W, H, 3);
+        accumulate_upsampled(lit, wide, {p.dirt_amount, p.dirt_amount, p.dirt_amount});
+        parallel_rows(H, [&](int y) {
+            for (int x = 0; x < W; ++x) {
+                const float* d = dirt->px(x, y);
+                const float* l = lit.px(x, y);
+                float* a = acc.px(x, y);
+                for (int c = 0; c < 3; ++c) a[c] += d[c] * l[c];
+            }
+        });
+    }
     return acc;
 }
 
@@ -504,7 +528,12 @@ Image render(const Image& src, const GlowParams& p) {
         if (p.view == View::Glow) {
             out = g;
         } else {
-            for (size_t i = 0; i < out.data.size(); ++i) out.data[i] += g.data[i];
+            for (size_t i = 0; i < out.data.size(); ++i) {
+                const float base = out.data[i];
+                out.data[i] += p.blend == Blend::Screen
+                                   ? std::min(g.data[i], 1.0f) * (1.0f - std::clamp(base, 0.0f, 1.0f))
+                                   : g.data[i];
+            }
         }
     }
     parallel_rows(H, [&](int y) {
@@ -517,7 +546,7 @@ Image render(const Image& src, const GlowParams& p) {
     return out;
 }
 
-Image render_premultiplied(const Image& src, const GlowParams& p) {
+Image render_premultiplied(const Image& src, const GlowParams& p, const GlowInputs& inputs) {
     const int W = src.width, H = src.height;
     Image lin(W, H, 3);
     std::vector<float> alpha(size_t(W) * H);
@@ -540,8 +569,46 @@ Image render_premultiplied(const Image& src, const GlowParams& p) {
         }
     });
 
+    // Glow source: the current frame, optionally blended with its
+    // neighbours so a highlight that flickers frame to frame glows steadily.
+    auto linearize = [&](const Image& img, bool premultiplied) {
+        Image l(W, H, 3);
+        parallel_rows(H, [&](int y) {
+            for (int x = 0; x < W; ++x) {
+                const float* s = img.px(x, y);
+                float a = img.channels == 4 ? s[3] : 1.0f;
+                float* o = l.px(x, y);
+                for (int c = 0; c < 3; ++c) {
+                    float v = s[c];
+                    if (premultiplied) v = a > 0.0f ? v / a : 0.0f;
+                    if (p.gamma_correct) v = srgb_to_linear(v);
+                    o[c] = v * a;
+                }
+            }
+        });
+        return l;
+    };
+
     Image glow;
-    if (p.view != View::Source) glow = glow_layer(lin, p);
+    if (p.view != View::Source) {
+        const float t = std::clamp(p.temporal_smooth, 0.0f, 1.0f);
+        const Image* glow_src = &lin;
+        Image blended;
+        if (t > 0.0f && !inputs.neighbors.empty()) {
+            blended = lin;
+            const float keep = 1.0f - 0.5f * t;
+            const float each = 0.5f * t / float(inputs.neighbors.size());
+            for (float& v : blended.data) v *= keep;
+            for (const Image* nb : inputs.neighbors) {
+                const Image l = linearize(*nb, true);
+                for (size_t i = 0; i < blended.data.size(); ++i) blended.data[i] += each * l.data[i];
+            }
+            glow_src = &blended;
+        }
+        Image dirt_lin;
+        if (inputs.dirt && p.dirt_amount > 0.0f) dirt_lin = linearize(*inputs.dirt, false);
+        glow = glow_layer(*glow_src, p, dirt_lin.data.empty() ? nullptr : &dirt_lin);
+    }
 
     Image out(W, H, 4);
     parallel_rows(H, [&](int y) {
@@ -557,7 +624,11 @@ Image render_premultiplied(const Image& src, const GlowParams& p) {
                     for (int c = 0; c < 3; ++c) premult[c] = g[c];
                     a = coverage;
                 } else {
-                    for (int c = 0; c < 3; ++c) premult[c] += g[c];
+                    for (int c = 0; c < 3; ++c) {
+                        const float screen = 1.0f - std::clamp(premult[c], 0.0f, 1.0f);
+                        // Screen is a + b - ab with the glow capped at 1, so it never blows out.
+                        premult[c] += p.blend == Blend::Screen ? std::min(g[c], 1.0f) * screen : g[c];
+                    }
                     a = a + (1.0f - a) * coverage;  // glow extends the layer's coverage
                 }
             }

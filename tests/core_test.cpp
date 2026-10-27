@@ -145,7 +145,69 @@ static void test_premultiplied_glow_extends_alpha() {
                 for (int c = 0; c < 3; ++c) CHECK(out.px(x, y)[c] <= out.px(x, y)[3] + 1e-5f);
 }
 
+static Image dot_scene(float v) {
+    Image img(64, 64, 4);
+    for (int c = 0; c < 3; ++c) img.px(32, 32)[c] = v;
+    img.px(32, 32)[3] = 1.0f;
+    return img;
+}
+
+static void test_screen_never_exceeds_one() {
+    Image src(64, 64, 4);
+    for (int y = 0; y < 64; ++y)
+        for (int x = 0; x < 64; ++x) {
+            const float v = (x > 24 && x < 40) ? 1.0f : 0.5f;
+            for (int c = 0; c < 3; ++c) src.px(x, y)[c] = v;
+            src.px(x, y)[3] = 1.0f;
+        }
+    GlowParams p;
+    p.radius = 20.0f;
+    p.exposure = 3.0f;
+    p.blend = Blend::Screen;
+    p.gamma_correct = false;
+    const Image out = render_premultiplied(src, p);
+    for (float v : out.data) CHECK(v <= 1.0f + 1e-5f);
+    p.blend = Blend::Add;
+    const Image add = render_premultiplied(src, p);
+    CHECK(add.px(32, 32)[0] > 1.0f);  // add does blow past 1
+}
+
+static void test_dirt_only_lights_where_glow_is() {
+    GlowParams p;
+    p.radius = 40.0f;
+    p.view = View::Glow;
+    const Image src = dot_scene(1.0f);
+    Image dirt(64, 64, 4);
+    for (float& v : dirt.data) v = 1.0f;
+    GlowInputs in;
+    in.dirt = &dirt;
+    const Image without = render_premultiplied(src, p, in);  // dirt_amount 0: no effect
+    p.dirt_amount = 1.0f;
+    const Image with = render_premultiplied(src, p, in);
+    CHECK(with.px(40, 32)[0] > without.px(40, 32)[0]);
+    const Image none = render_premultiplied(Image(64, 64, 4), p, in);  // no glow, no dirt
+    for (float v : none.data) CHECK(v == 0.0f);
+}
+
+static void test_temporal_smooth_blends_neighbours() {
+    GlowParams p;
+    p.radius = 10.0f;
+    p.view = View::Glow;
+    p.gamma_correct = false;
+    const Image on = dot_scene(1.0f), off = dot_scene(0.0f);
+    GlowInputs in;
+    in.neighbors = {&off, &off};
+    const Image raw = render_premultiplied(on, p, in);  // temporal_smooth 0: ignored
+    p.temporal_smooth = 1.0f;
+    const Image smooth = render_premultiplied(on, p, in);
+    // Half the energy comes from the current frame, half from the dark neighbours.
+    CHECK(std::fabs(smooth.px(34, 32)[1] - 0.5f * raw.px(34, 32)[1]) < 1e-4f);
+}
+
 int main() {
+    test_screen_never_exceeds_one();
+    test_dirt_only_lights_where_glow_is();
+    test_temporal_smooth_blends_neighbours();
     test_premultiplied_matches_render_when_opaque();
     test_premultiplied_glow_extends_alpha();
     test_blur_conserves_energy();
