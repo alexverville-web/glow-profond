@@ -38,13 +38,33 @@ static void test_blur_conserves_energy() {
 }
 
 static void test_downsample_conserves_mean() {
-    Image img(8, 6, 3);
-    for (size_t i = 0; i < img.data.size(); ++i) img.data[i] = float(i % 7) / 7.0f;
+    // Away from the edges (zeros outside), each level keeps 1/4 of the
+    // energy per texel count: sum(down) * 4 == sum(img). Odd sizes round up.
+    Image img(12, 10, 3);
+    for (int y = 2; y < 8; ++y)
+        for (int x = 2; x < 10; ++x)
+            for (int c = 0; c < 3; ++c) img.px(x, y)[c] = float((x * 7 + y * 3 + c) % 11) / 11.0f;
     const Image d = downsample2(img);
-    CHECK(d.width == 4 && d.height == 3);
+    CHECK(d.width == 6 && d.height == 5);
     CHECK(std::fabs(channel_sum(d, 1) * 4.0 - channel_sum(img, 1)) < 1e-4);
     const Image odd = downsample2(Image(5, 3, 3));
-    CHECK(odd.width == 3 && odd.height == 2);  // odd sizes round up
+    CHECK(odd.width == 3 && odd.height == 2);
+}
+
+static void test_glow_does_not_depend_on_grid_position() {
+    // Shifting a shape by 1-3 px must shift its glow, not reshape it: with a
+    // box downsample one side came out up to 4 % brighter.
+    for (int off : {0, 1, 2, 3}) {
+        Image src(512, 512, 3);
+        for (int y = 196 + off; y < 316 + off; ++y)
+            for (int x = 196 + off; x < 316 + off; ++x)
+                for (int c = 0; c < 3; ++c) src.px(x, y)[c] = 1.0f;
+        GlowParams p;
+        p.radius = 160.0f;
+        const Image g = glow_layer(src, p);
+        const float left = g.px(196 + off - 40, 256 + off)[1], right = g.px(315 + off + 40, 256 + off)[1];
+        CHECK(std::fabs(left - right) < 0.004f * std::max(left, right));
+    }
 }
 
 static void test_tent_upsample_preserves_constant() {
@@ -357,6 +377,7 @@ static void test_transparent_layer_over_black_matches_opaque() {
 }
 
 int main() {
+    test_glow_does_not_depend_on_grid_position();
     test_transparent_layer_over_black_matches_opaque();
     test_screen_composite();
     test_depth_spread_widens_far_sources();

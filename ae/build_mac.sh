@@ -62,4 +62,12 @@ if [ "${GLOW_METAL:-0}" = "1" ]; then
     "$REPO/core/src/glow.cpp" "$REPO/gpu/metal/GlowMetal.mm" "$REPO/gpu/metal/glow_metal_test.mm" \
     -framework Metal -framework Foundation
   "$OUT/glow_metal_test" --bench
+  # The AE render path (rects, aligned work area, CPU and GPU): radius sweep,
+  # moving layer, half-res preview.
+  xcrun clang++ -std=c++17 -O2 -fobjc-arc -isysroot "$SYSROOT" \
+    -I"$REPO/core/include" -I"$REPO/gpu/metal" -I"$OUT/obj" \
+    -o "$OUT/ae_path_sim" \
+    "$REPO/core/src/glow.cpp" "$REPO/gpu/metal/GlowMetal.mm" "$REPO/tests/ae_path_sim.mm" \
+    -framework Metal -framework Foundation
+  "$OUT/ae_path_sim" --quick
 fi

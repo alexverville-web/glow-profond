@@ -26,14 +26,28 @@ kernel void soft_threshold(device const float4* src [[buffer(0)]], device float4
     dst[i] = float4(p * contrib, 0.0f);
 }
 
-// downsample2: 2x2 box, odd sizes truncated (dst is floor(w/2) x floor(h/2)).
+// downsample2: [1 3 3 1] / 8 per axis (anti-aliased); odd sizes round up
+// (dst is ceil(w/2) x ceil(h/2)) with zeros past the edge, so texel i is
+// centred on pixels 2i and 2i + 1. Same order as the core: along x within
+// each of the four rows, then across the rows.
+static float4 tap4(float4 a, float4 b, float4 c, float4 d) { return (a + 3.0f * b + 3.0f * c + d) * 0.125f; }
+
 kernel void downsample2(device const float4* src [[buffer(0)]], device float4* dst [[buffer(1)]],
                         constant Dims& sd [[buffer(2)]], constant Dims& dd [[buffer(3)]],
                         uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= dd.w || gid.y >= dd.h) return;
-    const uint r0 = (2 * gid.y) * sd.w, r1 = r0 + sd.w, x = 2 * gid.x;
-    const float4 a = src[r0 + x], b = src[r0 + x + 1], c = src[r1 + x], e = src[r1 + x + 1];
-    dst[gid.y * dd.w + gid.x] = 0.25f * (a + c + b + e);
+    const int x = 2 * int(gid.x), y = 2 * int(gid.y), w = int(sd.w), h = int(sd.h);
+    float4 rows[4];
+    for (int j = 0; j < 4; ++j) {
+        const int yy = y - 1 + j;
+        float4 t[4];
+        for (int i = 0; i < 4; ++i) {
+            const int xx = x - 1 + i;
+            t[i] = (yy >= 0 && yy < h && xx >= 0 && xx < w) ? src[uint(yy) * sd.w + uint(xx)] : float4(0.0f);
+        }
+        rows[j] = tap4(t[0], t[1], t[2], t[3]);
+    }
+    dst[gid.y * dd.w + gid.x] = tap4(rows[0], rows[1], rows[2], rows[3]);
 }
 
 // Per-channel Gaussian taps for one axis: channel c uses weights
@@ -110,12 +124,12 @@ kernel void tent_y_add(device const float4* rows [[buffer(0)]], device float4* d
     dst[i] = o;
 }
 
-// Bilinear read at the position of output pixel (x, y) when img (sd) is
-// stretched over od, in accumulate_upsampled's arithmetic order.
-static float4 bilinear_at(device const float4* img, Dims sd, Dims od, uint x, uint y) {
+// Bilinear read at output pixel (x, y) of img (sd) upsampled by exactly
+// 1 / ratio (upsample_by in the core: identity when ratio is 1).
+static float4 bilinear_at(device const float4* img, Dims sd, float ratio, uint x, uint y) {
     const float w = float(sd.w), h = float(sd.h);
-    const float xs = clamp((float(x) + 0.5f) * w / float(od.w) - 0.5f, 0.0f, w - 1.0f);
-    const float ys = clamp((float(y) + 0.5f) * h / float(od.h) - 0.5f, 0.0f, h - 1.0f);
+    const float xs = clamp((float(x) + 0.5f) * ratio - 0.5f, 0.0f, w - 1.0f);
+    const float ys = clamp((float(y) + 0.5f) * ratio - 0.5f, 0.0f, h - 1.0f);
     const uint x0 = uint(floor(xs)), y0 = uint(floor(ys));
     const uint x1 = min(x0 + 1, sd.w - 1), y1 = min(y0 + 1, sd.h - 1);
     const float fx = xs - float(x0), fy = ys - float(y0);
@@ -125,10 +139,12 @@ static float4 bilinear_at(device const float4* img, Dims sd, Dims od, uint x, ui
 }
 
 struct FinishParams {
-    Dims acc;  // cascade result (full size, or smaller after a global downsample)
+    Dims acc;     // cascade result (full size, or smaller after a global downsample)
     Dims out;
+    float ratio;  // 1 / 2^downsample steps
     float saturation;
     int use_saturation;
+    int pad;
 };
 
 // End of glow_layer: back to full size (identity when sizes match), then
@@ -136,7 +152,7 @@ struct FinishParams {
 kernel void finish(device const float4* acc [[buffer(0)]], device float4* dst [[buffer(1)]],
                    constant FinishParams& fp [[buffer(2)]], uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= fp.out.w || gid.y >= fp.out.h) return;
-    float3 a = bilinear_at(acc, fp.acc, fp.out, gid.x, gid.y).xyz;
+    float3 a = bilinear_at(acc, fp.acc, fp.ratio, gid.x, gid.y).xyz;
     if (fp.use_saturation) {
         const float luma = 0.2126f * a.x + 0.7152f * a.y + 0.0722f * a.z;
         a = max(luma + fp.saturation * (a - luma), 0.0f);

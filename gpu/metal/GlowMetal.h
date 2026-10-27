@@ -65,6 +65,11 @@ public:
     bool submit_render_premultiplied(void* command_queue, const HostFrame& src, const HostFrame& dst,
                                      int work_width, int work_height, const GlowParams& p, bool clamp_premult);
 
+    // Test helper with AE's layout: separate input and output frames (RGBA
+    // here, BGRA on the GPU, rows padded) placed at offsets in the work area.
+    bool render_frames(const Image& in_rgba, int in_dx, int in_dy, Image& out_rgba, int out_dx, int out_dy,
+                       int work_width, int work_height, const GlowParams& p);
+
     // Test helper: render_premultiplied(rgba, p) through the GPU path.
     bool render_premultiplied(const Image& rgba, const GlowParams& p, Image& out, Timing* timing = nullptr);
 

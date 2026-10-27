@@ -83,13 +83,24 @@ def gaussian(img, sx, sy):
 
 
 def downsample2(img):
-    """2x2 box average. Odd sizes round up, with zeros past the edge: texel i
-    always covers source pixels 2i and 2i + 1, so every level stays aligned
-    with the image (truncating made coarse levels drift by up to 2^k pixels,
-    and the halo moved whenever the buffer size changed)."""
-    h, w = img.shape[:2]
-    i = np.pad(img, ((0, h % 2), (0, w % 2)) + ((0, 0),) * (img.ndim - 2))
-    return 0.25 * (i[0::2, 0::2] + i[1::2, 0::2] + i[0::2, 1::2] + i[1::2, 1::2])
+    """2x downsample with a [1 3 3 1] / 8 filter per axis. Odd sizes round up
+    and pixels past the edge are zero: texel i is centred on source pixels 2i
+    and 2i + 1, so every level stays aligned with the image whatever the
+    buffer size (truncating made coarse levels drift by up to 2^k pixels).
+    The filter is wider than a 2x2 box so the coarse levels don't alias: with
+    a box, the glow depended on where the shape sat on the coarse grid (one
+    side up to 4 % brighter, flicker on a slowly moving layer)."""
+
+    def along(a, axis):
+        n = a.shape[axis]
+        n2 = (n + 1) // 2
+        pad = [(0, 0)] * a.ndim
+        pad[axis] = (1, 2 * n2 - n + 1)  # taps 2i-1 .. 2i+2, zeros outside
+        p = np.pad(a, pad)
+        t = [np.take(p, range(k, k + 2 * n2, 2), axis=axis) for k in range(4)]
+        return (t[0] + 3.0 * t[1] + 3.0 * t[2] + t[3]) * 0.125
+
+    return along(along(np.asarray(img, np.float32), 1), 0).astype(np.float32)
 
 
 def upsample_to(img, shape):

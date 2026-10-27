@@ -224,6 +224,39 @@ PF_LRect Union(const PF_LRect& a, const PF_LRect& b) {
     return r;
 }
 
+// The look was calibrated on Deep Glow's default render with the core at
+// exposure -1.25; the Exposure slider shows that look as 0.
+constexpr float kExposureCalibration = -1.25f;
+
+A_long GlowPadding(const GlowParams& p);
+
+// Work area for a render: input and output rects, plus
+// - where AE's request cut the output short of the glow's reach (comp
+//   edges), a margin of 0.5 x radius: the coarse levels need texels past
+//   the visible edge, else the halo is off by up to 9/255 along the frame
+//   at large radii (measured against an unclipped render);
+// - its top-left moved down to a multiple of the coarsest pyramid cell
+//   (2^(levels - 1) pixels, times the global downsample) in layer
+//   coordinates, so the levels sit on the same grid for every radius and
+//   every requested rect: the halo can't shift or wobble when the buffer
+//   grows with the radius.
+PF_LRect WorkBounds(const PF_LRect& input, const PF_LRect& output, const GlowParams& p) {
+    PF_LRect b = Union(input, output);
+    if (IsEmpty(b) || p.view == glow_profond::View::Source) return b;
+    const PF_LRect reach = Expand(input, GlowPadding(p));
+    const A_long margin = A_long(std::ceil(0.5f * p.radius));
+    if (output.left > reach.left) b.left -= margin;
+    if (output.top > reach.top) b.top -= margin;
+    if (output.right < reach.right) b.right += margin;
+    if (output.bottom < reach.bottom) b.bottom += margin;
+    const int steps = glow_profond::level_count(p) - 1 + int(std::log2(float(std::max(p.downsample, 1))));
+    const A_long cell = A_long(1) << std::clamp(steps, 0, 14);
+    auto floor_to = [cell](A_long v) { return (v >= 0 ? v / cell : -((-v + cell - 1) / cell)) * cell; };
+    b.left = floor_to(b.left);
+    b.top = floor_to(b.top);
+    return b;
+}
+
 float ToFloat(const PF_ParamDef& def) { return static_cast<float>(def.u.fs_d.value); }
 
 // Reads every parameter at the current time. Pixel sizes are scaled to the
@@ -254,7 +287,7 @@ PF_Err ReadParams(PF_InData* in_data, PF_OutData* out_data, GlowParams& p, bool*
         auto on = [&](int index) { return defs[index].u.bd.value != 0; };
         p.radius = ToFloat(defs[GP_RADIUS]) * scale;
         p.base_sigma = ToFloat(defs[GP_BASE_SIGMA]) * scale;
-        p.exposure = ToFloat(defs[GP_EXPOSURE]);
+        p.exposure = ToFloat(defs[GP_EXPOSURE]) + kExposureCalibration;
         p.spread = SpreadToExponent(ToFloat(defs[GP_SPREAD_AMOUNT]));
         p.threshold = ToFloat(defs[GP_THRESHOLD]);
         p.threshold_smooth = ToFloat(defs[GP_THRESHOLD_SMOOTH]);
@@ -307,13 +340,15 @@ PF_Err ReadParams(PF_InData* in_data, PF_OutData* out_data, GlowParams& p, bool*
     return err;
 }
 
-// How far the glow can reach beyond its source, in pixels: three sigmas of
-// the widest level, stretched by aspect and per-channel radius.
+// How far the glow can reach beyond its source, in pixels: four sigmas of
+// the widest level, stretched by aspect and per-channel radius. Three were
+// not enough: once sRGB-encoded, the tail at 3 sigma is still ~2/255, and
+// the glow ended on a faint visible box.
 A_long GlowPadding(const GlowParams& p) {
     if (p.view == glow_profond::View::Source) return 0;
     const float max_mult = std::max({p.rgb_radius[0], p.rgb_radius[1], p.rgb_radius[2], 1.0f});
     const float stretch = std::max(std::sqrt(p.aspect), 1.0f / std::sqrt(p.aspect));
-    const float reach = 3.0f * p.radius * max_mult * stretch + 4.0f * p.downsample;
+    const float reach = 4.0f * p.radius * max_mult * stretch + 4.0f * p.downsample;
     return static_cast<A_long>(std::ceil(std::min(reach, 30000.0f)));
 }
 
@@ -450,7 +485,7 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data) {
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Radius", 0, 4000, 0, 1000, 160, PF_Precision_TENTHS, 0, 0, ID_RADIUS);
     AEFX_CLR_STRUCT(def);
-    PF_ADD_FLOAT_SLIDERX("Exposure", -10, 10, -5, 5, -1.25, PF_Precision_HUNDREDTHS, 0, 0, ID_EXPOSURE);
+    PF_ADD_FLOAT_SLIDERX("Exposure", -10, 10, -5, 5, 0, PF_Precision_HUNDREDTHS, 0, 0, ID_EXPOSURE);
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Threshold", 0, 100, 0, 1, 0, PF_Precision_HUNDREDTHS, 0, 0, ID_THRESHOLD);
     AEFX_CLR_STRUCT(def);
@@ -560,27 +595,28 @@ struct Preset {
 };
 
 // Indexed by PRESET_* - 2 (Custom sets nothing). Weights are per octave, so
-// big radii add light: wide presets use lower exposures. Thresholds stay
+// big radii add light: wide presets use lower exposures. Exposures are UI
+// values (kExposureCalibration is added at render). Thresholds stay
 // below 0.7 so they still catch highlights in ordinary (SDR) footage.
 // Checked on build-mac/test/presets_v04.png.
 const Preset kPresets[] = {
     // Neon: tight, saturated, colour kept.
-    {120, -0.75f, 50, 140, BLEND_ADD, 0.3f, 0.5f, false, 4, false, {1.15f, 1, 0.85f}, TINT_NONE,
+    {120, 0.5f, 50, 140, BLEND_ADD, 0.3f, 0.5f, false, 4, false, {1.15f, 1, 0.85f}, TINT_NONE,
      {255, 255, 255}, {255, 102, 204}, {77, 77, 255}, false},
     // Soft Sun: huge warm halo, screened so whites hold.
-    {500, -1.75f, 70, 90, BLEND_SCREEN, 0.4f, 0.8f, false, 4, false, {1.15f, 1, 0.85f}, TINT_TWO,
+    {500, -0.5f, 70, 90, BLEND_SCREEN, 0.4f, 0.8f, false, 4, false, {1.15f, 1, 0.85f}, TINT_TWO,
      {255, 250, 235}, {255, 200, 140}, {255, 170, 90}, true},
     // Cinematic: highlights only, a hint of chromatic spread, ACES.
-    {300, -1.0f, 55, 100, BLEND_ADD, 0.5f, 0.6f, false, 4, true, {1.15f, 1, 0.85f}, TINT_NONE,
+    {300, 0.25f, 55, 100, BLEND_ADD, 0.5f, 0.6f, false, 4, true, {1.15f, 1, 0.85f}, TINT_NONE,
      {255, 255, 255}, {255, 102, 204}, {77, 77, 255}, true},
     // Anamorphic: wide horizontal streak, blue halo.
-    {400, -0.75f, 55, 120, BLEND_ADD, 0.4f, 0.5f, true, 6, false, {1.15f, 1, 0.85f}, TINT_TWO,
+    {400, 0.5f, 55, 120, BLEND_ADD, 0.4f, 0.5f, true, 6, false, {1.15f, 1, 0.85f}, TINT_TWO,
      {255, 255, 255}, {160, 190, 255}, {80, 140, 255}, true},
     // Glowing Text: whole shape glows, close and bright.
-    {100, -0.5f, 50, 120, BLEND_ADD, 0, 0.5f, false, 4, false, {1.15f, 1, 0.85f}, TINT_NONE,
+    {100, 0.75f, 50, 120, BLEND_ADD, 0, 0.5f, false, 4, false, {1.15f, 1, 0.85f}, TINT_NONE,
      {255, 255, 255}, {255, 102, 204}, {77, 77, 255}, false},
     // Subtle Bloom: a soft lift of the brightest areas.
-    {250, -2.0f, 60, 100, BLEND_SCREEN, 0.6f, 0.5f, false, 4, false, {1.15f, 1, 0.85f}, TINT_NONE,
+    {250, -0.75f, 60, 100, BLEND_SCREEN, 0.6f, 0.5f, false, 4, false, {1.15f, 1, 0.85f}, TINT_NONE,
      {255, 255, 255}, {255, 102, 204}, {77, 77, 255}, false},
 };
 static_assert(sizeof(kPresets) / sizeof(kPresets[0]) == PRESET_COUNT - 1, "one entry per preset");
@@ -759,7 +795,7 @@ PF_Err SmartRender(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra
         ERR(worlds->PF_GetPixelFormat(output, &format));
 
         // Work on the union of input and output so the glow sees its sources.
-        const PF_LRect bounds = Union(plan->input_rect, plan->output_rect);
+        const PF_LRect bounds = WorkBounds(plan->input_rect, plan->output_rect, p);
         Image src(int(bounds.right - bounds.left), int(bounds.bottom - bounds.top), 4);
         const int in_dx = int(plan->input_rect.left - bounds.left);
         const int in_dy = int(plan->input_rect.top - bounds.top);
@@ -930,7 +966,7 @@ PF_Err SmartRenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderEx
         ERR(gpu->GetGPUWorldData(in_data->effect_ref, output, &dst_mem));
 
         if (!err) {
-            const PF_LRect bounds = Union(plan->input_rect, plan->output_rect);
+            const PF_LRect bounds = WorkBounds(plan->input_rect, plan->output_rect, p);
             glow_profond::metal::GlowMetal::HostFrame src, dst;
             src.buffer = src_mem;
             src.width = int(input->width);

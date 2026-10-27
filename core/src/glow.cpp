@@ -132,24 +132,33 @@ Image soft_threshold(const Image& rgb, float t, float smooth) {
 }
 
 Image downsample2(const Image& img) {
-    // Odd sizes round up, with zeros past the edge (like the reference):
-    // texel i always covers source pixels 2i and 2i + 1, so every level stays
-    // aligned with the image whatever the buffer size.
-    Image out((img.width + 1) / 2, (img.height + 1) / 2, img.channels);
-    const int ch = img.channels;
-    parallel_rows(out.height, [&](int y) {
-        const bool has_y1 = 2 * y + 1 < img.height;
-        for (int x = 0; x < out.width; ++x) {
-            const bool has_x1 = 2 * x + 1 < img.width;
-            const float* a = img.px(2 * x, 2 * y);
-            const float* b = has_x1 ? img.px(2 * x + 1, 2 * y) : nullptr;
-            const float* c = has_y1 ? img.px(2 * x, 2 * y + 1) : nullptr;
-            const float* d = has_x1 && has_y1 ? img.px(2 * x + 1, 2 * y + 1) : nullptr;
-            float* o = out.px(x, y);
-            for (int k = 0; k < ch; ++k) {
-                // Same summation order as the reference: a + c + b + d.
-                o[k] = 0.25f * (a[k] + (c ? c[k] : 0.0f) + (b ? b[k] : 0.0f) + (d ? d[k] : 0.0f));
-            }
+    // 2x downsample with a [1 3 3 1] / 8 filter per axis (like the
+    // reference). Odd sizes round up and pixels past the edge are zero, so
+    // texel i is centred on source pixels 2i and 2i + 1 at every level and
+    // the levels stay aligned with the image whatever the buffer size. The
+    // wider-than-box filter stops the coarse levels aliasing: with a 2x2 box
+    // the glow changed with the shape's position on the coarse grid (one
+    // side up to 4 % brighter, visible as flicker on a slowly moving layer).
+    const int w = img.width, h = img.height, ch = img.channels;
+    const int w2 = (w + 1) / 2, h2 = (h + 1) / 2;
+    auto tap4 = [](float a, float b, float c, float d) { return (a + 3.0f * b + 3.0f * c + d) * 0.125f; };
+    Image tmp(w2, h, ch);  // along x first
+    parallel_rows(h, [&](int y) {
+        const float* row = img.px(0, y);
+        auto at = [&](int x, int k) { return x >= 0 && x < w ? row[size_t(x) * ch + k] : 0.0f; };
+        float* o = tmp.px(0, y);
+        for (int x = 0; x < w2; ++x)
+            for (int k = 0; k < ch; ++k)
+                o[size_t(x) * ch + k] = tap4(at(2 * x - 1, k), at(2 * x, k), at(2 * x + 1, k), at(2 * x + 2, k));
+    });
+    Image out(w2, h2, ch);
+    const size_t stride = size_t(w2) * ch;
+    parallel_rows(h2, [&](int y) {
+        auto row = [&](int yy) { return yy >= 0 && yy < h ? tmp.px(0, yy) : nullptr; };
+        const float *r0 = row(2 * y - 1), *r1 = row(2 * y), *r2 = row(2 * y + 1), *r3 = row(2 * y + 2);
+        float* o = out.px(0, y);
+        for (size_t i = 0; i < stride; ++i) {
+            o[i] = tap4(r0 ? r0[i] : 0.0f, r1 ? r1[i] : 0.0f, r2 ? r2[i] : 0.0f, r3 ? r3[i] : 0.0f);
         }
     });
     return out;

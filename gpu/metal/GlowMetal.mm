@@ -57,8 +57,10 @@ struct BlurParams {
 };
 struct FinishParams {
     Dims acc, out;
+    float ratio;
     float saturation;
     int32_t use_saturation;
+    int32_t pad;
 };
 struct PrepareParams {
     uint32_t src_w, src_h, src_pitch;
@@ -96,7 +98,8 @@ std::vector<TentTaps> tent_taps(int target, int n) {
             tt.idx[tt.n] = idx;
             tt.w[tt.n++] = w;
         };
-        const float base = (float(i) + 0.5f) * float(n) / float(target) - 0.5f;
+        // Exactly 2x, the inverse of downsample2 (as in the core).
+        const float base = (float(i) + 0.5f) * 0.5f - 0.5f;
         for (int d = 0; d < 3; ++d) {
             const float c = std::clamp(base + float(d - 1), 0.0f, float(n - 1));
             const int i0 = int(std::floor(c));
@@ -128,12 +131,12 @@ Plan make_plan(int W, int H, const GlowParams& p) {
     const int extra = int(std::log2(float(std::max(p.downsample, 1))));
     for (int i = 0; i < extra; ++i) {
         const Dims& d = plan.chain.back();
-        plan.chain.push_back({d.w / 2, d.h / 2});
+        plan.chain.push_back({(d.w + 1) / 2, (d.h + 1) / 2});
     }
     const Dims base = plan.chain.back();
     if (base.w == 0 || base.h == 0) return plan;
 
-    const float scale = float(H) / float(base.h);
+    const float scale = float(1 << extra);
     // The core's level plan (per-level sigma, unnormalized weights), so the
     // GPU follows any change to it.
     const LevelPlan lp = level_plan(p);
@@ -146,9 +149,8 @@ Plan make_plan(int W, int H, const GlowParams& p) {
     int w = int(base.w), h = int(base.h);
     for (int k = 0; k < n; ++k) {
         if (k > 0) {
-            w /= 2;
-            h /= 2;
-            if (w == 0 || h == 0) break;  // tiny images: fewer levels
+            w = (w + 1) / 2;  // rounds up, like downsample2
+            h = (h + 1) / 2;
         }
         Plan::Level lv;
         lv.w = w;
@@ -316,6 +318,7 @@ struct GlowMetal::Impl {
         FinishParams fp{};
         fp.acc = {uint32_t(plan.levels[0].w), uint32_t(plan.levels[0].h)};
         fp.out = full;
+        fp.ratio = 1.0f / float(1 << (int(plan.chain.size()) - 1));
         fp.saturation = p.saturation;
         fp.use_saturation = p.saturation != 1.0f;
         [enc setBuffer:acc offset:0 atIndex:0];
@@ -499,6 +502,47 @@ bool GlowMetal::submit_render_premultiplied(void* command_queue, const HostFrame
         }
         [cb commit];
         return cb.error == nil;
+    }
+}
+
+bool GlowMetal::render_frames(const Image& in_rgba, int in_dx, int in_dy, Image& out_rgba, int out_dx, int out_dy,
+                              int work_width, int work_height, const GlowParams& p) {
+    @autoreleasepool {
+        const int ip = in_rgba.width + 3, op = out_rgba.width + 5;  // padded rows, like AE worlds
+        id<MTLBuffer> in = [impl_->device newBufferWithLength:size_t(ip) * std::max(in_rgba.height, 1) * 16
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> res = [impl_->device newBufferWithLength:size_t(op) * std::max(out_rgba.height, 1) * 16
+                                                       options:MTLResourceStorageModeShared];
+        float* f = static_cast<float*>(in.contents);
+        for (int y = 0; y < in_rgba.height; ++y)
+            for (int x = 0; x < in_rgba.width; ++x) {
+                const float* s = in_rgba.px(x, y);
+                float* d = f + (size_t(y) * ip + x) * 4;
+                d[0] = s[2];
+                d[1] = s[1];
+                d[2] = s[0];
+                d[3] = s[3];
+            }
+        HostFrame frame{(__bridge void*)in, in_rgba.width, in_rgba.height, ip, in_dx, in_dy};
+        HostFrame target{(__bridge void*)res, out_rgba.width, out_rgba.height, op, out_dx, out_dy};
+        id<MTLCommandBuffer> cb = [impl_->queue commandBuffer];
+        if (!encode_render_premultiplied((__bridge void*)cb, frame, target, work_width, work_height, p, false)) {
+            return false;
+        }
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status != MTLCommandBufferStatusCompleted) return false;
+        const float* r = static_cast<const float*>(res.contents);
+        for (int y = 0; y < out_rgba.height; ++y)
+            for (int x = 0; x < out_rgba.width; ++x) {
+                const float* s = r + (size_t(y) * op + x) * 4;
+                float* d = out_rgba.px(x, y);
+                d[0] = s[2];
+                d[1] = s[1];
+                d[2] = s[0];
+                d[3] = s[3];
+            }
+        return true;
     }
 }
 
