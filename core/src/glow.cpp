@@ -490,6 +490,18 @@ Image glow_layer(const Image& src, const GlowParams& p, const Image* dirt) {
         acc = Image(W, H, 3);
         accumulate_upsampled(acc, cascade, {1.0f, 1.0f, 1.0f});
     }
+    if (p.saturation != 1.0f) {
+        // Saturated sources glow towards white in the core; scaling the
+        // chroma around the luma lets a neon keep (or lose) its colour.
+        const float s = p.saturation;
+        parallel_rows(H, [&](int y) {
+            float* a = acc.px(0, y);
+            for (int x = 0; x < W; ++x, a += 3) {
+                const float luma = 0.2126f * a[0] + 0.7152f * a[1] + 0.0722f * a[2];
+                for (int c = 0; c < 3; ++c) a[c] = std::max(luma + s * (a[c] - luma), 0.0f);
+            }
+        });
+    }
     if (want_dirt) {
         Image lit(W, H, 3);
         accumulate_upsampled(lit, wide, {p.dirt_amount, p.dirt_amount, p.dirt_amount});
@@ -508,6 +520,7 @@ Image glow_layer(const Image& src, const GlowParams& p, const Image* dirt) {
 Image render(const Image& src, const GlowParams& p) {
     const int W = src.width, H = src.height;
     Image lin(W, H, 3);
+    std::vector<float> coverage(size_t(W) * H);
     parallel_rows(H, [&](int y) {
         for (int x = 0; x < W; ++x) {
             const float* s = src.px(x, y);
@@ -519,6 +532,7 @@ Image render(const Image& src, const GlowParams& p) {
             }
             float* o = lin.px(x, y);
             for (int c = 0; c < 3; ++c) o[c] = (p.gamma_correct ? srgb_to_linear(rgb[c]) : rgb[c]) * alpha;
+            coverage[size_t(y) * W + x] = alpha;
         }
     });
 
@@ -530,9 +544,11 @@ Image render(const Image& src, const GlowParams& p) {
         } else {
             for (size_t i = 0; i < out.data.size(); ++i) {
                 const float base = out.data[i];
-                out.data[i] += p.blend == Blend::Screen
-                                   ? std::min(g.data[i], 1.0f) * (1.0f - std::clamp(base, 0.0f, 1.0f))
-                                   : g.data[i];
+                float add = p.blend == Blend::Screen
+                                ? std::min(g.data[i], 1.0f) * (1.0f - std::clamp(base, 0.0f, 1.0f))
+                                : g.data[i];
+                if (p.view == View::Behind) add *= 1.0f - coverage[i / 3];  // only where the layer isn't
+                out.data[i] += add;
             }
         }
     }
@@ -624,10 +640,12 @@ Image render_premultiplied(const Image& src, const GlowParams& p, const GlowInpu
                     for (int c = 0; c < 3; ++c) premult[c] = g[c];
                     a = coverage;
                 } else {
+                    // Behind: the glow passes under the layer, through its transparency.
+                    const float under = p.view == View::Behind ? 1.0f - a : 1.0f;
                     for (int c = 0; c < 3; ++c) {
                         const float screen = 1.0f - std::clamp(premult[c], 0.0f, 1.0f);
                         // Screen is a + b - ab with the glow capped at 1, so it never blows out.
-                        premult[c] += p.blend == Blend::Screen ? std::min(g[c], 1.0f) * screen : g[c];
+                        premult[c] += under * (p.blend == Blend::Screen ? std::min(g[c], 1.0f) * screen : g[c]);
                     }
                     a = a + (1.0f - a) * coverage;  // glow extends the layer's coverage
                 }

@@ -119,7 +119,8 @@ int usage() {
                  "  --tint R,G,B          repeat for core -> halo gradient (1,1,1)\n"
                  "  --base-sigma F        tightest level sigma (1.5)\n"
                  "  --downsample N        extra global downsample, power of two (1)\n"
-                 "  --view final|glow|source\n"
+                 "  --saturation F        glow saturation, 1 = as is (1)\n"
+                 "  --view final|glow|source|behind\n"
                  "  --unmult  --tonemap  --linear (disable gamma correction)\n"
                  "  --bench N             time N renders and print the average\n";
     return 2;
@@ -145,6 +146,7 @@ int main(int argc, char** argv) {
         else if (a == "--aspect" && has_value) p.aspect = std::strtof(next(), nullptr);
         else if (a == "--rgb-radius" && has_value) p.rgb_radius = parse_rgb(next());
         else if (a == "--base-sigma" && has_value) p.base_sigma = std::strtof(next(), nullptr);
+        else if (a == "--saturation" && has_value) p.saturation = std::strtof(next(), nullptr);
         else if (a == "--downsample" && has_value) p.downsample = std::atoi(next());
         else if (a == "--tint" && has_value) {
             if (!tint_set) p.tint.clear();
@@ -154,6 +156,7 @@ int main(int argc, char** argv) {
             const std::string v = next();
             p.view = v == "glow" ? glow_profond::View::Glow
                    : v == "source" ? glow_profond::View::Source
+                   : v == "behind" ? glow_profond::View::Behind
                                    : glow_profond::View::Final;
         } else if (a == "--bench" && has_value) bench = std::atoi(next());
         else if (a == "--unmult") p.unmult = true;

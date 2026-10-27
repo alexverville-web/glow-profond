@@ -24,7 +24,8 @@ class GlowParams:
     tonemap: bool = False            # ACES-fitted curve on the composite
     base_sigma: float = 1.5          # sigma of the tightest level, in pixels
     downsample: int = 1              # extra global downsample (speed / stylized grain)
-    view: str = "final"              # "final" | "glow" | "source"
+    view: str = "final"              # "final" | "glow" | "source" | "behind" (glow only where alpha < 1)
+    saturation: float = 1.0          # glow saturation around its Rec. 709 luma (0 grey, 2 double)
 
 
 def srgb_to_linear(x):
@@ -189,7 +190,12 @@ def glow_layer(src_lin, p: GlowParams):
         acc = upsample_tent2(acc, levels[k].shape[:2]) + blur_level(k)
     if acc.shape[:2] != (H, W):
         acc = upsample_to(acc, (H, W))
-    return acc * 2.0 ** p.exposure
+    acc = acc * 2.0 ** p.exposure
+    if p.saturation != 1.0:
+        # Scale the chroma around the luma: a neon keeps (or loses) its colour.
+        luma = acc @ np.array([0.2126, 0.7152, 0.0722], np.float32)
+        acc = np.maximum(luma[..., None] + p.saturation * (acc - luma[..., None]), 0.0)
+    return acc
 
 
 def aces_fitted(x):
@@ -209,7 +215,12 @@ def render(src, p: GlowParams):
         out = lin_premult
     else:
         g = glow_layer(lin_premult, p)
-        out = g if p.view == "glow" else lin_premult + g
+        if p.view == "glow":
+            out = g
+        elif p.view == "behind":
+            out = lin_premult + g * (1 - alpha)  # the halo passes under the layer
+        else:
+            out = lin_premult + g
     if p.tonemap:
         out = aces_fitted(out)
     out = linear_to_srgb(out) if p.gamma_correct else out

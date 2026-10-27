@@ -15,7 +15,9 @@ namespace glow_profond {
 
 using Rgb = std::array<float, 3>;
 
-enum class View { Final, Glow, Source };
+// Behind: the glow only shows where the layer is transparent, so text and
+// logos stay crisp with the halo behind them.
+enum class View { Final, Glow, Source, Behind };
 
 // How the glow is laid over the source. Screen never pushes a channel that
 // is at or below 1 past 1, so whites don't blow out.
@@ -39,6 +41,7 @@ struct GlowParams {
     Blend blend = Blend::Add;
     float dirt_amount = 0.0f;        // lens dirt lit by the wide part of the glow
     float temporal_smooth = 0.0f;    // 0..1, blends neighbouring frames into the glow source
+    float saturation = 1.0f;         // glow saturation around its Rec. 709 luma: 0 grey, 1 as is, 2 double
 };
 
 // Planar-free, interleaved image with a fixed channel count.

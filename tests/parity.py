@@ -35,6 +35,10 @@ CASES = [
     ("linear_downsample", GlowParams(radius=120, gamma_correct=False, downsample=2),
      ["--radius", "120", "--linear", "--downsample", "2"]),
     ("unmult", GlowParams(radius=80, unmult=True), ["--radius", "80", "--unmult"]),
+    ("saturation", GlowParams(radius=120, saturation=1.8), ["--radius", "120", "--saturation", "1.8"]),
+    ("desaturated", GlowParams(radius=120, saturation=0.0), ["--radius", "120", "--saturation", "0"]),
+    ("behind_unmult", GlowParams(radius=80, unmult=True, view="behind"),
+     ["--radius", "80", "--unmult", "--view", "behind"]),
 ]
 
 

@@ -204,7 +204,42 @@ static void test_temporal_smooth_blends_neighbours() {
     CHECK(std::fabs(smooth.px(34, 32)[1] - 0.5f * raw.px(34, 32)[1]) < 1e-4f);
 }
 
+static void test_saturation() {
+    // A pure red source: saturation 0 makes the glow grey (equal channels),
+    // saturation 1 changes nothing, and the result is never negative.
+    Image src(64, 64, 3);
+    src.px(32, 32)[0] = 1.0f;
+    GlowParams p;
+    p.radius = 8.0f;
+    const Image base = glow_layer(src, p);
+    p.saturation = 0.0f;
+    const Image grey = glow_layer(src, p);
+    const float* g = grey.px(34, 32);
+    CHECK(std::fabs(g[0] - g[1]) < 1e-7f && std::fabs(g[1] - g[2]) < 1e-7f && g[0] > 0.0f);
+    p.saturation = 3.0f;
+    const Image vivid = glow_layer(src, p);
+    for (float v : vivid.data) CHECK(v >= 0.0f);
+    CHECK(vivid.px(34, 32)[0] > base.px(34, 32)[0]);
+}
+
+static void test_behind_keeps_opaque_pixels() {
+    // Opaque pixels are untouched by the glow; transparent ones receive it.
+    Image src(64, 64, 4);
+    for (int y = 28; y < 36; ++y)
+        for (int x = 28; x < 36; ++x)
+            for (int c = 0; c < 4; ++c) src.px(x, y)[c] = 1.0f;
+    GlowParams p;
+    p.radius = 10.0f;
+    p.exposure = 2.0f;
+    p.view = View::Behind;
+    const Image out = render_premultiplied(src, p);
+    for (int c = 0; c < 4; ++c) CHECK(std::fabs(out.px(31, 31)[c] - 1.0f) < 1e-5f);
+    CHECK(out.px(40, 32)[3] > 0.0f && out.px(40, 32)[0] > 0.0f);
+}
+
 int main() {
+    test_saturation();
+    test_behind_keeps_opaque_pixels();
     test_screen_never_exceeds_one();
     test_dirt_only_lights_where_glow_is();
     test_temporal_smooth_blends_neighbours();
