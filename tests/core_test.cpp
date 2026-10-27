@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <vector>
 
 #include "glow_profond/glow.hpp"
 
@@ -78,7 +79,11 @@ static void test_level_count() {
     p.radius = 3.0f;
     CHECK(level_count(p) == 2);
     p.radius = 400.0f;
-    CHECK(level_count(p) == 9);  // floor(log2(266.7)) + 1
+    CHECK(level_count(p) == 10);  // ceil(log2(266.7) + 1): the 10th level fades in
+    p.radius = 1.5f * 32.0f;  // exactly 6 octaves: all weights 1, last sigma = radius
+    const LevelPlan plan = level_plan(p);
+    CHECK(plan.sigmas.size() == 6 && std::fabs(plan.sigmas[5] - p.radius) < 1e-3f);
+    for (float w : plan.weights) CHECK(std::fabs(w - 1.0f) < 1e-5f);
 }
 
 static void test_tonemap_and_srgb() {
@@ -98,8 +103,8 @@ static void test_exposure_off_view_source_is_identity() {
 }
 
 static void test_glow_energy_is_exposure() {
-    // Equal-weight levels are normalized, so total glow energy equals the
-    // thresholded input energy times 2^exposure (away from the borders).
+    // Total glow energy is the thresholded input energy times the summed
+    // level weights times 2^exposure (away from the borders).
     Image src(256, 256, 3);
     for (int c = 0; c < 3; ++c) src.px(128, 128)[c] = 1.0f;
     GlowParams p;
@@ -107,7 +112,26 @@ static void test_glow_energy_is_exposure() {
     p.threshold_smooth = 1e-5f;
     p.exposure = 1.0f;
     const Image g = glow_layer(src, p);
-    CHECK(std::fabs(channel_sum(g, 1) - 2.0) < 0.02);
+    double wsum = 0.0;
+    for (float w : level_plan(p).weights) wsum += w;
+    CHECK(std::fabs(channel_sum(g, 1) - 2.0 * wsum) < 0.01 * wsum);
+}
+
+static void test_radius_grows_the_halo_smoothly() {
+    // Sliding the radius up never dims the far halo and never jumps.
+    Image src(256, 256, 3);
+    for (int c = 0; c < 3; ++c) src.px(128, 128)[c] = 1000.0f;
+    GlowParams p;
+    p.threshold_smooth = 1e-5f;
+    std::vector<float> far;
+    for (float r = 20.0f; r <= 70.0f; r += 1.0f) {
+        p.radius = r;
+        far.push_back(glow_layer(src, p).px(128 + 60, 128)[1]);
+    }
+    for (size_t i = 1; i < far.size(); ++i) {
+        CHECK(far[i] >= far[i - 1] - 1e-6f);
+        CHECK(far[i] - far[i - 1] < 0.1f * far.back());  // no jump
+    }
 }
 
 static void test_premultiplied_matches_render_when_opaque() {
@@ -186,7 +210,7 @@ static void test_depth_spread_widens_far_sources() {
     Image src(128, 128, 3);
     for (int c = 0; c < 3; ++c) src.px(64, 64)[c] = 1.0f;
     GlowParams p;
-    p.radius = 40.0f;
+    p.radius = 24.0f;  // widest sigma well inside the canvas, so no energy leaks
     Image near(128, 128, 1), far(128, 128, 1);
     for (float& v : far.data) v = 1.0f;
     p.depth_spread = 1.0f;
@@ -325,6 +349,7 @@ int main() {
     test_tent_upsample_preserves_constant();
     test_threshold();
     test_level_count();
+    test_radius_grows_the_halo_smoothly();
     test_tonemap_and_srgb();
     test_exposure_off_view_source_is_identity();
     test_glow_energy_is_exposure();

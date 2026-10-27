@@ -375,10 +375,27 @@ Image upsample_tent2(const Image& img, int width, int height) {
 
 void parallel_for_rows(int rows, const std::function<void(int)>& fn) { parallel_rows(rows, fn); }
 
-int level_count(const GlowParams& p) {
-    const float ratio = std::max(p.radius / p.base_sigma, 1.0f);
-    return std::max(1, int(std::floor(std::log2(ratio))) + 1);
+LevelPlan level_plan(const GlowParams& p) {
+    // Levels at base_sigma * 2^k, except the widest, whose sigma is exactly
+    // the radius and whose weight fades in with the fractional octave: the
+    // halo grows smoothly with the radius instead of jumping a level at a time.
+    // Weights are not normalized, so a larger radius only adds halo further out.
+    const double nf = std::log2(std::max(double(p.radius) / double(p.base_sigma), 1.0)) + 1.0;
+    const int n = std::max(1, int(std::ceil(nf - 1e-6)));
+    LevelPlan plan;
+    plan.sigmas.resize(static_cast<size_t>(n));
+    plan.weights.resize(static_cast<size_t>(n));
+    for (int k = 0; k < n; ++k) {
+        const double sigma = double(p.base_sigma) * std::pow(2.0, k == n - 1 ? nf - 1.0 : double(k));
+        double w = std::pow(sigma / double(p.base_sigma), 2.0 - double(p.spread));
+        if (k == n - 1) w *= std::min(nf - double(n - 1), 1.0);
+        plan.sigmas[size_t(k)] = float(sigma);
+        plan.weights[size_t(k)] = float(w);
+    }
+    return plan;
 }
+
+int level_count(const GlowParams& p) { return int(level_plan(p).sigmas.size()); }
 
 namespace {
 
@@ -423,17 +440,13 @@ Image glow_layer(const Image& src, const GlowParams& p, const Image* depth, cons
     if (thr.width == 0 || thr.height == 0) return Image(W, H, 3);
 
     const float scale = float(H) / float(thr.height);
-    const int n = level_count(p);
-    std::vector<float> weights(static_cast<size_t>(n));
+    const LevelPlan plan = level_plan(p);
+    const std::vector<float>& weights = plan.weights;
+    const int n = int(weights.size());
     float wsum = 0.0f;
-    for (int k = 0; k < n; ++k) {
-        weights[k] = std::pow(std::pow(2.0f, float(k)), 2.0f - p.spread);
-        wsum += weights[k];
-    }
-    for (float& w : weights) w /= wsum;
+    for (float w : weights) wsum += w;
 
     const float ax = std::sqrt(p.aspect), ay = 1.0f / std::sqrt(p.aspect);
-    const float sigma_level = p.base_sigma / scale;  // same in every level's own pixels
     const bool occlude = p.occlusion && depth;
     const float spread = depth ? std::clamp(p.depth_spread, 0.0f, 1.0f) : 0.0f;
     const bool want_dirt = dirt && p.dirt_amount > 0.0f;
@@ -447,7 +460,7 @@ Image glow_layer(const Image& src, const GlowParams& p, const Image* depth, cons
     float wc = 0.0f;
     for (int k = 0; k < n; ++k) {
         c[k] = std::pow(2.0f, float(k) - float(n) / 2.0f) - 1.0f;
-        wc += weights[k] * c[k];
+        wc += weights[k] / wsum * c[k];
     }
     // Channels 3-4 carry intensity and intensity * depth for occlusion.
     const int pc = occlude ? 5 : 3;
@@ -512,6 +525,8 @@ Image glow_layer(const Image& src, const GlowParams& p, const Image* depth, cons
         const float var = kTentStepVariance * (4.0f / 3.0f) * (1.0f - std::pow(4.0f, -float(k)));
         std::vector<float> sx(static_cast<size_t>(pc)), sy(static_cast<size_t>(pc));
         for (int ch = 0; ch < pc; ++ch) {
+            // Sigma in level k's own pixels: base_sigma for all but the widest.
+            const float sigma_level = plan.sigmas[size_t(k)] / (std::pow(2.0f, float(k)) * scale);
             const float s = sigma_level * (ch < 3 ? p.rgb_radius[ch] : 1.0f);
             sx[ch] = std::sqrt(std::max((s * ax) * (s * ax) - var, 0.0f));
             sy[ch] = std::sqrt(std::max((s * ay) * (s * ay) - var, 0.0f));

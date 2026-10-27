@@ -102,17 +102,27 @@ def upsample_to(img, shape):
     return top * (1 - fy) + bot * fy
 
 
-def level_weights(n, spread):
-    """Weights for Gaussians at sigma_k = s0 * 2^k.
+def level_plan(radius, base_sigma, spread):
+    """Sigmas and weights of the pyramid levels, continuous in the radius.
+
+    Levels sit at sigma_k = s0 * 2^k, except the widest one, whose sigma is
+    exactly the radius and whose weight fades in with the fractional octave:
+    sliding the radius grows the halo smoothly, without the jumps a whole
+    level appearing at once would cause.
 
     A sum of area-normalized 2D Gaussians with log-spaced sigmas and weights
-    w_k ~ sigma_k^(2-p) has a point-spread function ~ r^-p between the
+    w_k ~ (sigma_k / s0)^(2-p) has a point-spread function ~ r^-p between the
     smallest and largest sigma. p = 2 gives equal weights per octave, i.e.
-    inverse-square falloff.
+    inverse-square falloff. Weights are not normalized: a larger radius adds
+    halo further out and leaves the glow near the source as it was.
     """
-    k = np.arange(n, dtype=np.float32)
-    w = (2.0 ** k) ** (2.0 - spread)
-    return w / w.sum()
+    nf = float(np.log2(max(radius / base_sigma, 1.0))) + 1.0
+    n = max(1, int(np.ceil(nf - 1e-6)))
+    sigmas = base_sigma * 2.0 ** np.arange(n, dtype=np.float64)
+    sigmas[-1] = base_sigma * 2.0 ** (nf - 1.0)
+    weights = (sigmas / base_sigma) ** (2.0 - spread)
+    weights[-1] *= min(nf - (n - 1), 1.0)
+    return sigmas, weights
 
 
 def _tint_for_level(tint, k, n):
@@ -185,10 +195,11 @@ def glow_layer(src_lin, p: GlowParams, depth=None, dirt=None):
         thr = downsample2(thr)
         d = None if d is None else downsample2(d)
     scale = H / thr.shape[0]
-    n = max(1, int(np.floor(np.log2(max(p.radius / p.base_sigma, 1.0)))) + 1)
-    weights = level_weights(n, p.spread)
+    sigmas, weights = level_plan(p.radius, p.base_sigma, p.spread)
+    n = len(sigmas)
     ax, ay = np.sqrt(p.aspect), 1.0 / np.sqrt(p.aspect)
-    sigma_level = p.base_sigma / scale  # same in every level's own pixels
+    # Sigma of level k in its own pixels: base_sigma for all but the widest.
+    sigma_level = sigmas / (2.0 ** np.arange(n) * scale)
     occlude = p.occlusion and d is not None
     spread = 0.0 if d is None else float(np.clip(p.depth_spread, 0.0, 1.0))
     large_from = n // 2  # levels feeding the lens dirt
@@ -199,7 +210,7 @@ def glow_layer(src_lin, p: GlowParams, depth=None, dirt=None):
     # level input k = down^k(a) + c_k * down^k(b), c_k = 2^(k - n/2) - 1.
     c = 2.0 ** (np.arange(n) - n / 2.0) - 1.0
     if spread > 0:
-        z = 1.0 + spread * d * float(np.dot(weights, c))
+        z = 1.0 + spread * d * float(np.dot(weights / weights.sum(), c))
         a_img, b_img = thr / z, thr * spread * d / z
     else:
         a_img, b_img = thr, None
@@ -224,7 +235,7 @@ def glow_layer(src_lin, p: GlowParams, depth=None, dirt=None):
         lvl = pyr_a[k] if pyr_b is None else pyr_a[k] + c[k] * pyr_b[k]
         blurred = np.empty_like(lvl)
         for ch in range(lvl.shape[-1]):
-            s = sigma_level * (p.rgb_radius[ch] if ch < 3 else 1.0)
+            s = sigma_level[k] * (p.rgb_radius[ch] if ch < 3 else 1.0)
             sx = np.sqrt(max((s * ax) ** 2 - extra, 0.0))
             sy = np.sqrt(max((s * ay) ** 2 - extra, 0.0))
             blurred[..., ch] = gaussian(lvl[..., ch:ch + 1], sx, sy)[..., 0]

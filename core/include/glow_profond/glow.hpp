@@ -61,7 +61,13 @@ struct Image {
     const float* px(int x, int y) const { return data.data() + (size_t(y) * width + x) * channels; }
 };
 
-// Number of pyramid levels used for a given radius (matches the reference).
+// Pyramid levels for a given radius (matches the reference level_plan):
+// blur sigma of each level in source pixels, and its weight.
+struct LevelPlan {
+    std::vector<float> sigmas;
+    std::vector<float> weights;
+};
+LevelPlan level_plan(const GlowParams& p);
 int level_count(const GlowParams& p);
 
 // Glow only, linear light, same size as src (3 channels, premultiplied).
