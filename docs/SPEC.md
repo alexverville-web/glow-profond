@@ -19,7 +19,7 @@ Ce que la documentation publique affirme (observé) :
 | --- | --- |
 | Falloff « physiquement exact » en inverse du carré | Somme de gaussiennes par octave, poids égaux (voir plus bas) |
 | Correction gamma, résultat linéaire même en espace non linéaire | `gamma_correct` : décodage sRGB → glow → réencodage |
-| Seuil HDR avec lissage (moins de scintillement) | `threshold` + `threshold_smooth` (soft knee) |
+| Seuil HDR avec lissage (moins de scintillement) | `threshold` + `threshold_smooth` (genou relatif au seuil, 0 à 1) |
 | Spread, rayon, aspect ratio variable | `spread` (exposant p), `radius`, `aspect` |
 | Aberration chromatique, multiplicateurs de rayon RGB | `rgb_radius` (σ par canal) |
 | Teinte multicolore | `tint` : dégradé de couleurs du cœur vers le halo |
@@ -36,7 +36,7 @@ suit est notre choix de conception.
 ## Pipeline
 
 1. Unmult optionnel, puis linéarisation (sRGB → linéaire) si `gamma_correct`.
-2. Seuil doux sur max(R,G,B) : `soft = clamp(br - t + k, 0, 2k)² / 4k`,
+2. Seuil doux sur max(R,G,B), genou `k = t × threshold_smooth` (t = 0 laisse passer l'image intacte) : `soft = clamp(br - t + k, 0, 2k)² / 4k`,
    facteur = `max(soft, br - t) / br`.
 3. Pyramide : niveau k à résolution 1/2^k, flou gaussien de σ_k = σ₀·2^k
    (donc σ constant en pixels du niveau : coût quasi indépendant du rayon).

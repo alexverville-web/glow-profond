@@ -14,7 +14,7 @@ class GlowParams:
     radius: float = 400.0            # largest blur sigma, in pixels
     exposure: float = 0.0            # stops applied to the glow
     threshold: float = 0.0           # in linear light
-    threshold_smooth: float = 0.25   # soft knee width, linear light
+    threshold_smooth: float = 0.5    # soft knee, as a fraction of threshold (0..1)
     spread: float = 2.0              # falloff exponent p: glow ~ 1/r^p (2 = inverse square)
     aspect: float = 1.0              # >1 stretches horizontally, <1 vertically
     rgb_radius: tuple = (1.0, 1.0, 1.0)  # per-channel radius multipliers (chromatic aberration)
@@ -37,10 +37,14 @@ def linear_to_srgb(x):
     return np.where(x <= 0.0031308, x * 12.92, 1.055 * np.power(x, 1 / 2.4) - 0.055)
 
 
-def soft_threshold(rgb, t, knee):
-    """Unity-style soft-knee threshold on max(R,G,B). Smooth = less flicker."""
+def soft_threshold(rgb, t, smooth):
+    """Unity-style soft-knee threshold on max(R,G,B). Smooth = less flicker.
+
+    The knee is relative to the threshold, so t = 0 passes the image through
+    unchanged instead of lifting dark pixels to ~knee/4.
+    """
     br = rgb.max(axis=-1, keepdims=True)
-    knee = max(knee, 1e-5)
+    knee = max(t * smooth, 1e-5)
     soft = np.clip(br - t + knee, 0.0, 2 * knee) ** 2 / (4 * knee)
     contrib = np.maximum(soft, br - t) / np.maximum(br, 1e-6)
     return rgb * contrib
