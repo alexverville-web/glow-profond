@@ -118,8 +118,48 @@ def _tint_for_level(tint, k, n):
     return cols[i] * (1 - (t - i)) + cols[i + 1] * (t - i)
 
 
+def upsample_tent2(img, shape):
+    """3x3 tent upsample (Jimenez, CoD: AW bloom) to an exact (H, W).
+
+    Bilinear taps at -1/0/+1 source texels around each target pixel's
+    position in source coordinates, weights 1-2-1 / 2-4-2 / 1-2-1 over 16,
+    edges clamped like upsample_to.
+    """
+    H, W = shape
+    h, w = img.shape[:2]
+    ys = (np.arange(H) + 0.5) * h / H - 0.5
+    xs = (np.arange(W) + 0.5) * w / W - 0.5
+
+    def taps(coords, n):
+        out = []
+        for d in (-1.0, 0.0, 1.0):
+            c = np.clip(coords + d, 0, n - 1)
+            i0 = np.floor(c).astype(int)
+            out.append((i0, np.minimum(i0 + 1, n - 1), c - i0))
+        return out
+
+    ty, tx = taps(ys, h), taps(xs, w)
+    tw = (0.25, 0.5, 0.25)
+    # Separable: tent then bilinear along x, then along y.
+    rows = sum(wx * (img[:, x0] * (1 - fx)[None, :, None] + img[:, x1] * fx[None, :, None])
+               for wx, (x0, x1, fx) in zip(tw, tx))
+    return sum(wy * (rows[y0] * (1 - fy)[:, None, None] + rows[y1] * fy[:, None, None])
+               for wy, (y0, y1, fy) in zip(tw, ty))
+
+
+# Variance (in source texels, per axis) that one 2x tent upsample adds:
+# tent taps at +-1 (0.5) plus the bilinear split at +-0.25 texel (0.1875).
+TENT_STEP_VARIANCE = 0.6875
+
+
 def glow_layer(src_lin, p: GlowParams):
-    """Glow only, in linear light, same size as src_lin (H, W, 3)."""
+    """Glow only, in linear light, same size as src_lin (H, W, 3).
+
+    Levels are blurred at 1/2^k resolution, then folded back from coarsest to
+    finest with a 2x tent upsample per step (~1.33x the image in total work).
+    Each level's blur is shrunk by the variance its upsample chain adds back,
+    so the effective sigma stays base_sigma * 2^k.
+    """
     H, W = src_lin.shape[:2]
     img = soft_threshold(src_lin, p.threshold, p.threshold_smooth)
     for _ in range(int(np.log2(max(p.downsample, 1)))):
@@ -128,18 +168,27 @@ def glow_layer(src_lin, p: GlowParams):
     n = max(1, int(np.floor(np.log2(max(p.radius / p.base_sigma, 1.0)))) + 1)
     weights = level_weights(n, p.spread)
     ax, ay = np.sqrt(p.aspect), 1.0 / np.sqrt(p.aspect)
-    acc = np.zeros_like(src_lin)
-    level = img
-    for k in range(n):
-        if k > 0:
-            level = downsample2(level)  # level k lives at 1 / 2^k resolution
-        lvl_scale = scale * 2 ** k
-        sigma_level = p.base_sigma * 2 ** k / lvl_scale  # sigma in this level's pixels
-        blurred = np.empty_like(level)
+    sigma_level = p.base_sigma / scale  # same in every level's own pixels
+    levels = [img]
+    for _ in range(1, n):
+        levels.append(downsample2(levels[-1]))
+
+    def blur_level(k):
+        # Variance added by the k upsample steps back to level 0, in level-k texels.
+        extra = TENT_STEP_VARIANCE * (4.0 / 3.0) * (1.0 - 4.0 ** -k)
+        out = np.empty_like(levels[k])
         for c in range(3):
             s = sigma_level * p.rgb_radius[c]
-            blurred[..., c] = gaussian(level[..., c:c + 1], s * ax, s * ay)[..., 0]
-        acc += weights[k] * _tint_for_level(p.tint, k, n) * upsample_to(blurred, (H, W))
+            sx = np.sqrt(max((s * ax) ** 2 - extra, 0.0))
+            sy = np.sqrt(max((s * ay) ** 2 - extra, 0.0))
+            out[..., c] = gaussian(levels[k][..., c:c + 1], sx, sy)[..., 0]
+        return weights[k] * _tint_for_level(p.tint, k, n) * out
+
+    acc = blur_level(n - 1)
+    for k in range(n - 2, -1, -1):
+        acc = upsample_tent2(acc, levels[k].shape[:2]) + blur_level(k)
+    if acc.shape[:2] != (H, W):
+        acc = upsample_to(acc, (H, W))
     return acc * 2.0 ** p.exposure
 
 

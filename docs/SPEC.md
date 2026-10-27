@@ -46,8 +46,8 @@ suit est notre choix de conception.
    rayon max. **p = 2 → poids égaux par octave → falloff en 1/r².**
    p < 2 élargit le halo, p > 2 le resserre.
 5. Par canal, σ multiplié par `rgb_radius[c]` ; en x/y par √aspect et 1/√aspect.
-6. Chaque niveau est teinté (interpolation dans `tint`) puis suréchantillonné
-   et accumulé ; le tout × 2^exposure.
+6. Chaque niveau est teinté (interpolation dans `tint`), puis la cascade tente
+   les additionne du plus grossier au plus fin ; le tout × 2^exposure.
 7. Composite additif en linéaire sur la source prémultipliée, tonemap
    optionnel, réencodage.
 
@@ -57,9 +57,9 @@ suit est notre choix de conception.
 `reference/demo.py` produit une planche de presets. Le plugin AE devra
 reproduire ces images à une tolérance près (tests de régression image).
 
-Défaut connu : le suréchantillonnage bilinéaire des niveaux les plus petits
-laisse un léger escalier dans les halos très larges. À remplacer par un
-upsample tente 3×3 (style dual filter / bloom CoD) ou bicubique.
+Remontée des niveaux : cascade du plus grossier au plus fin, un upsample
+tente 3×3 ×2 par étape (Jimenez), environ 1,33× l'image en coût. Le σ de
+chaque niveau est réduit de la variance ajoutée par sa chaîne d'upsamples, pour garder σ_k = σ₀·2^k et le falloff en 1/r² (pente mesurée −2,0 entre 32 et 64 px).
 
 ## Plan
 
