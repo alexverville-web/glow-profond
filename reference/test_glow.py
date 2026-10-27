@@ -5,7 +5,8 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
-from glow import GlowParams, glow_layer, level_weights, soft_threshold, upsample_tent2  # noqa: E402
+from glow import (GlowParams, composite, glow_layer, level_weights, render,  # noqa: E402
+                  soft_threshold, upsample_tent2)
 
 
 def test_zero_threshold_is_identity():
@@ -40,6 +41,66 @@ def test_point_glow_is_inverse_square_and_conserves_energy():
     slope = np.log(prof[64] / prof[16]) / np.log(4)
     assert abs(slope + 2) < 0.1, slope
     assert abs(g.sum() - 1000) < 20, g.sum()
+
+
+def _point(n=256, value=1000.0):
+    img = np.zeros((n, n, 3), np.float32)
+    img[n // 2, n // 2] = value
+    return img
+
+
+def _second_moment(g):
+    h, w = g.shape[:2]
+    yy, xx = np.mgrid[0:h, 0:w]
+    r2 = (yy - h // 2) ** 2 + (xx - w // 2) ** 2
+    lum = g[..., 0]
+    return float((lum * r2).sum() / lum.sum())
+
+
+def test_screen_never_exceeds_one():
+    rng = np.random.default_rng(2)
+    src, g = rng.uniform(0, 1, (2, 32, 32, 3)).astype(np.float32)
+    out = composite(src, g, "screen")
+    assert out.max() <= 1.0 + 1e-6 and (out >= src - 1e-6).all()
+    assert np.allclose(composite(src, g, "add"), src + g)
+
+
+def test_dirt_adds_untinted_wide_glow_only():
+    img, p = _point(), GlowParams(radius=50, tint=((1, 0, 0),))
+    base = glow_layer(img, p)
+    assert np.array_equal(base, glow_layer(img, p, dirt=np.ones((256, 256, 3))))  # amount 0
+    p.dirt_amount = 1.0
+    extra = glow_layer(img, p, dirt=np.ones((256, 256, 3))) - base
+    n = 6  # floor(log2(50 / 1.5)) + 1
+    expected = level_weights(n, 2.0)[n // 2:].sum() * 1000
+    assert np.allclose(extra.sum(axis=(0, 1)), expected, rtol=0.03)  # untinted: G and B too
+
+
+def test_depth_spread_widens_far_sources_and_keeps_energy():
+    img, p = _point(), GlowParams(radius=50, depth_spread=1.0)
+    near = glow_layer(img, p, depth=np.zeros((256, 256)))
+    far = glow_layer(img, p, depth=np.ones((256, 256)))
+    assert np.allclose(near, glow_layer(img, GlowParams(radius=50)), atol=1e-6)
+    assert abs(far[..., 0].sum() - near[..., 0].sum()) < 0.01 * near[..., 0].sum()
+    assert _second_moment(far) > 1.5 * _second_moment(near)
+
+
+def test_occlusion_masks_glow_on_nearer_pixels_only():
+    img = _point()
+    depth = np.ones((256, 256), np.float32)
+    depth[:, :100] = 0.0  # near wall left of a far source at x = 128
+    p = GlowParams(radius=50, occlusion=True)
+    g = glow_layer(img, p, depth=depth)
+    free = glow_layer(img, GlowParams(radius=50))
+    assert g[128, 90, 0] < 1e-3 * free[128, 90, 0]
+    assert np.allclose(g[:, 100:], free[:, 100:], rtol=1e-4, atol=1e-7)
+
+
+def test_new_features_off_match_defaults():
+    src = np.random.default_rng(3).uniform(0, 1, (64, 64, 3)).astype(np.float32)
+    a = render(src, GlowParams(radius=30))
+    b = render(src, GlowParams(radius=30), depth=np.ones((64, 64)), dirt=np.ones((64, 64, 3)))
+    assert np.array_equal(a, b)
 
 
 if __name__ == "__main__":
