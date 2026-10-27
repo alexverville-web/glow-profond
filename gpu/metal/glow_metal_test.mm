@@ -1,6 +1,7 @@
 // Compares the Metal glow with the CPU core on the same input (the plain
 // path: no depth, no lens dirt), and times both. Exit code 1 if any case differs by more than the tolerance.
 //   glow_metal_test [--bench]
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -106,6 +107,60 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Full render_premultiplied (the After Effects path): a transparent layer
+    // with shapes, soft edges and an HDR spot, every view and blend.
+    {
+        const int W = 803, H = 451;
+        Image rgba(W, H, 4);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float* o = rgba.px(x, y);
+                const float dx = float(x - 250), dy = float(y - 220);
+                const float disc = std::clamp(60.0f - std::sqrt(dx * dx + dy * dy), 0.0f, 1.0f);  // soft edge
+                const bool bar = x > 450 && x < 700 && y > 200 && y < 230;
+                const float a = std::max(disc, bar ? 1.0f : 0.0f);
+                const float r = bar ? 0.2f : 1.0f, g = bar ? 0.7f : 0.6f, b = bar ? 1.0f : 0.2f;
+                o[0] = r * a;
+                o[1] = g * a;
+                o[2] = b * a;
+                o[3] = a;
+                if (x == 600 && y == 300) { o[0] = o[1] = o[2] = 8.0f; o[3] = 1.0f; }  // HDR spot (32 bpc)
+            }
+        struct RCase {
+            const char* name;
+            GlowParams p;
+        };
+        std::vector<RCase> rc;
+        auto addr = [&](const char* name, auto&& tweak) {
+            GlowParams p;
+            p.radius = 160.0f;
+            p.exposure = -1.25f;
+            p.spread = 1.85f;
+            tweak(p);
+            rc.push_back({name, p});
+        };
+        addr("final", [](GlowParams&) {});
+        addr("glow_only", [](GlowParams& p) { p.view = glow_profond::View::Glow; });
+        addr("source", [](GlowParams& p) { p.view = glow_profond::View::Source; });
+        addr("behind_screen", [](GlowParams& p) { p.view = glow_profond::View::Behind; p.blend = glow_profond::Blend::Screen; });
+        addr("tonemap_unmult", [](GlowParams& p) { p.tonemap = true; p.unmult = true; });
+        addr("linear_sat", [](GlowParams& p) { p.gamma_correct = false; p.saturation = 1.6f; });
+        for (const RCase& c : rc) {
+            const Image ref = glow_profond::render_premultiplied(rgba, c.p);
+            Image out;
+            if (!gpu->render_premultiplied(rgba, c.p, out)) {
+                std::printf("FAIL render %-14s: Metal run failed\n", c.name);
+                ++failures;
+                continue;
+            }
+            float max_diff = 0.0f;
+            for (size_t i = 0; i < ref.data.size(); ++i) max_diff = std::max(max_diff, std::fabs(ref.data[i] - out.data[i]));
+            const bool ok = max_diff <= kTolerance;
+            failures += !ok;
+            std::printf("%s render %-14s %dx%d max|diff| = %.2e\n", ok ? "ok  " : "FAIL", c.name, W, H, max_diff);
+        }
+    }
+
     if (bench) {
         const int bsizes[][2] = {{1920, 1080}, {3840, 2160}};
         for (const auto& sz : bsizes) {
@@ -124,6 +179,28 @@ int main(int argc, char** argv) {
             }
             std::printf("bench %dx%d radius 400: CPU glow_layer %.1f ms | Metal GPU %.1f ms (%.1f ms with upload/readback)\n",
                         sz[0], sz[1], cpu, gpu_ms, total);
+            // The whole effect as After Effects runs it (defaults, transparent layer).
+            Image rgba(sz[0], sz[1], 4);
+            for (size_t i = 0; i < src.data.size() / 3; ++i) {
+                const float a = std::min(src.data[i * 3], 1.0f);
+                for (int c = 0; c < 3; ++c) rgba.data[i * 4 + c] = std::min(src.data[i * 3 + c], 1.0f) * a;
+                rgba.data[i * 4 + 3] = a;
+            }
+            GlowParams q;
+            q.radius = 160.0f;
+            q.exposure = -1.25f;
+            q.spread = 1.85f;
+            double cpu_r = 1e9, gpu_r = 1e9;
+            for (int i = 0; i < 5; ++i) {
+                const auto t0 = std::chrono::steady_clock::now();
+                const Image ref = glow_profond::render_premultiplied(rgba, q);
+                cpu_r = std::min(cpu_r, ms_since(t0));
+                Image out;
+                glow_profond::metal::Timing t;
+                gpu->render_premultiplied(rgba, q, out, &t);
+                gpu_r = std::min(gpu_r, t.gpu_ms);
+            }
+            std::printf("bench %dx%d full effect (defaults): CPU %.1f ms | Metal GPU %.1f ms\n", sz[0], sz[1], cpu_r, gpu_r);
         }
     }
     return failures ? 1 : 0;

@@ -80,8 +80,14 @@ l'aperçu : un aperçu en demi-résolution garde le même look.
   `render()` (testé).
 - Le buffer de sortie est agrandi de 3 × rayon autour du calque
   (`PF_OutFlag_I_EXPAND_BUFFER`), limité à la zone demandée par AE.
-- Le rendu est sur CPU, multithreadé. Le portage GPU (Metal) est en cours
-  dans `gpu/metal/`.
+- Rendu GPU Metal (Mac) quand l'accélération GPU d'After Effects est active
+  (Paramètres du projet › Rendu vidéo et effets › Accélération GPU Mercury
+  (Metal)) : les images restent sur le GPU, le pipeline complet
+  (`gpu/metal/`, noyaux compilés à l'exécution) donne le même résultat que le
+  CPU à 2e-6 près (`GLOW_METAL=1 ae/build_mac.sh` le vérifie). Avec un calque
+  de profondeur, la saleté de lentille ou l'anti-scintillement, AE repasse
+  automatiquement sur le CPU (multithreadé). En « Logiciel Mercury
+  uniquement », tout est sur CPU.
 - Sorties 8 et 16 bpc : dither ordonné 8×8 (ancré dans l'espace du calque)
   contre le banding des grands halos ; la couleur reste ≤ alpha.
 - Anti-scintillement : l'effet demande les images t − 1 et t + 1

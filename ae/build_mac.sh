@@ -8,7 +8,8 @@
 #
 # GLOW_METAL=1 also builds and runs build-mac/glow_metal_test, which checks
 # the Metal GPU path (gpu/metal/) against the CPU core and times both. The
-# plug-in itself does not use Metal yet.
+# plug-in renders on Metal when AE's GPU acceleration is on (Project
+# Settings > Mercury GPU Acceleration (Metal)), else on the CPU.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -24,13 +25,17 @@ rm -rf "$BUNDLE"
 mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources" "$OUT/obj"
 
 echo "Compiling…"
+# Metal kernels are embedded as source (no offline Metal compiler in the
+# Command Line Tools) and compiled at runtime on AE's GPU device.
+{ echo 'R"GLOWMETAL('; cat "$REPO/gpu/metal/GlowKernels.metal"; echo ')GLOWMETAL"'; } > "$OUT/obj/GlowKernels.metal.inc"
 xcrun clang++ -std=c++17 -O2 -arch arm64 -arch x86_64 -mmacosx-version-min=11.0 \
-  -fvisibility=hidden -isysroot "$SYSROOT" \
-  -I"$REPO/core/include" -I"$REPO/ae" \
+  -fvisibility=hidden -fobjc-arc -isysroot "$SYSROOT" \
+  -I"$REPO/core/include" -I"$REPO/ae" -I"$REPO/gpu/metal" -I"$OUT/obj" \
   -I"$SDK/Examples/Headers" -I"$SDK/Examples/Headers/SP" \
   -I"$SDK/Examples/Util" -I"$SDK/Examples/Resources" \
   -bundle -o "$BUNDLE/Contents/MacOS/GlowProfond" \
-  "$REPO/core/src/glow.cpp" "$REPO/ae/GlowProfond.cpp"
+  "$REPO/core/src/glow.cpp" "$REPO/ae/GlowProfond.cpp" "$REPO/gpu/metal/GlowMetal.mm" \
+  -framework Metal -framework Foundation
 
 echo "Compiling PiPL…"
 xcrun Rez -o "$BUNDLE/Contents/Resources/GlowProfond.rsrc" -useDF -script Roman \
@@ -51,7 +56,6 @@ if [ "${GLOW_METAL:-0}" = "1" ]; then
   echo "Building the Metal GPU test…"
   # No offline Metal compiler in the Command Line Tools: the kernels are
   # embedded as source and compiled at runtime.
-  { echo 'R"GLOWMETAL('; cat "$REPO/gpu/metal/GlowKernels.metal"; echo ')GLOWMETAL"'; } > "$OUT/obj/GlowKernels.metal.inc"
   xcrun clang++ -std=c++17 -O2 -fobjc-arc -arch arm64 -arch x86_64 -mmacosx-version-min=11.0 -isysroot "$SYSROOT" \
     -I"$REPO/core/include" -I"$REPO/gpu/metal" -I"$OUT/obj" \
     -o "$OUT/glow_metal_test" \

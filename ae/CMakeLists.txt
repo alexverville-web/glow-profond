@@ -12,10 +12,21 @@ if(NOT APPLE)
   return()
 endif()
 
-add_library(GlowProfond MODULE GlowProfond.cpp)
-target_link_libraries(GlowProfond PRIVATE glow_core)
+enable_language(OBJCXX)
+
+# Metal GPU path: kernels embedded as a source string, compiled at runtime.
+set(GLOW_METAL_DIR ${CMAKE_SOURCE_DIR}/gpu/metal)
+file(READ ${GLOW_METAL_DIR}/GlowKernels.metal GLOW_METAL_SRC)
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/GlowKernels.metal.inc "R\"GLOWMETAL(${GLOW_METAL_SRC})GLOWMETAL\"")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${GLOW_METAL_DIR}/GlowKernels.metal)
+
+add_library(GlowProfond MODULE GlowProfond.cpp ${GLOW_METAL_DIR}/GlowMetal.mm)
+target_link_libraries(GlowProfond PRIVATE glow_core "-framework Metal" "-framework Foundation")
+set_source_files_properties(${GLOW_METAL_DIR}/GlowMetal.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 target_include_directories(GlowProfond PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}
+  ${GLOW_METAL_DIR}
+  ${CMAKE_CURRENT_BINARY_DIR}
   ${AE_HEADERS}
   ${AE_HEADERS}/SP
   ${AE_SDK_ROOT}/Examples/Util

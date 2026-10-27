@@ -5,6 +5,8 @@
 // 8, 16 and 32 bpc are supported; buffers are converted to float RGBA.
 #include <algorithm>
 #include <cmath>
+#include <memory>
+#include <string>
 #include <exception>
 #include <new>
 
@@ -21,13 +23,19 @@
 #include "GlowProfond_Version.h"
 #include "glow_profond/glow.hpp"
 
+#ifdef AE_OS_MAC
+#include "AE_EffectGPUSuites.h"
+#include "AE_EffectPixelFormat.h"
+#include "GlowMetal.h"
+#endif
+
 static_assert(GP_OUT_FLAGS == (PF_OutFlag_DEEP_COLOR_AWARE | PF_OutFlag_I_EXPAND_BUFFER | PF_OutFlag_WIDE_TIME_INPUT |
                                PF_OutFlag_SEND_UPDATE_PARAMS_UI),
               "PiPL out flags out of sync with GlobalSetup");
 static_assert(GP_OUT_FLAGS_2 == (PF_OutFlag2_FLOAT_COLOR_AWARE | PF_OutFlag2_SUPPORTS_SMART_RENDER |
                                  PF_OutFlag2_SUPPORTS_THREADED_RENDERING |
                                  PF_OutFlag2_PARAM_GROUP_START_COLLAPSED_FLAG |
-                                 PF_OutFlag2_AUTOMATIC_WIDE_TIME_INPUT),
+                                 PF_OutFlag2_AUTOMATIC_WIDE_TIME_INPUT | PF_OutFlag2_SUPPORTS_GPU_RENDER_F32),
               "PiPL out flags 2 out of sync with GlobalSetup");
 static_assert(GP_VERSION_PACKED == PF_VERSION(GP_MAJOR_VERSION, GP_MINOR_VERSION, GP_BUG_VERSION,
                                               GP_STAGE_VERSION, GP_BUILD_VERSION),
@@ -722,6 +730,10 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
         delete plan;
         return err;
     }
+    // The GPU path covers everything but the extra inputs (depth, lens
+    // dirt, neighbouring frames); with those, AE renders on the CPU.
+    const bool extra_inputs = plan->dirt || plan->depth || !IsEmpty(plan->prev_rect) || !IsEmpty(plan->next_rect);
+    if (!extra_inputs) extra->output->flags |= PF_RenderOutputFlag_GPU_RENDER_POSSIBLE;
     extra->output->pre_render_data = plan;
     extra->output->delete_pre_render_data_func = DeleteRenderPlan;
     return err;
@@ -861,6 +873,90 @@ PF_Err SmartRender(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra
     return err;
 }
 
+#ifdef AE_OS_MAC
+// Metal device setup: one GlowMetal (compiled kernels) per AE GPU device.
+// Other frameworks (OpenCL, CUDA) are not set up, so AE stays on the CPU.
+PF_Err GPUDeviceSetup(PF_InData* in_data, PF_OutData* out_data, PF_GPUDeviceSetupExtra* extra) {
+    PF_Err err = PF_Err_NONE;
+    if (extra->input->what_gpu != PF_GPU_Framework_METAL) return err;
+    AEFX_SuiteScoper<PF_GPUDeviceSuite1> gpu(in_data, kPFGPUDeviceSuite, kPFGPUDeviceSuiteVersion1, out_data);
+    PF_GPUDeviceInfo info;
+    AEFX_CLR_STRUCT(info);
+    ERR(gpu->GetDeviceInfo(in_data->effect_ref, extra->input->device_index, &info));
+    if (err || !info.devicePV) return err;
+    std::string error;
+    std::unique_ptr<glow_profond::metal::GlowMetal> metal =
+        glow_profond::metal::GlowMetal::create_for_device(info.devicePV, &error);
+    if (!metal) return err;  // no GPU flag: AE keeps rendering on the CPU
+    extra->output->gpu_data = metal.release();
+    out_data->out_flags2 = PF_OutFlag2_SUPPORTS_GPU_RENDER_F32;
+    return err;
+}
+
+PF_Err GPUDeviceSetdown(PF_GPUDeviceSetdownExtra* extra) {
+    if (extra->input->what_gpu == PF_GPU_Framework_METAL) {
+        delete static_cast<glow_profond::metal::GlowMetal*>(extra->input->gpu_data);
+    }
+    return PF_Err_NONE;
+}
+
+// Same rects and parameters as SmartRender, pixels stay on the GPU: AE's
+// BGRA float worlds go straight into the Metal pipeline.
+PF_Err SmartRenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra* extra) {
+    PF_Err err = PF_Err_NONE, err2 = PF_Err_NONE;
+    const RenderPlan* plan = static_cast<const RenderPlan*>(extra->input->pre_render_data);
+    auto* metal = static_cast<glow_profond::metal::GlowMetal*>(const_cast<void*>(extra->input->gpu_data));
+    if (!plan || !metal || extra->input->what_gpu != PF_GPU_Framework_METAL) return PF_Err_BAD_CALLBACK_PARAM;
+
+    GlowParams p;
+    ERR(ReadParams(in_data, out_data, p));
+    PF_EffectWorld* input = nullptr;
+    PF_EffectWorld* output = nullptr;
+    ERR(extra->cb->checkout_layer_pixels(in_data->effect_ref, GP_INPUT, &input));
+    ERR(extra->cb->checkout_output(in_data->effect_ref, &output));
+
+    if (!err && input && output) {
+        AEFX_SuiteScoper<PF_WorldSuite2> worlds(in_data, kPFWorldSuite, kPFWorldSuiteVersion2, out_data);
+        AEFX_SuiteScoper<PF_GPUDeviceSuite1> gpu(in_data, kPFGPUDeviceSuite, kPFGPUDeviceSuiteVersion1, out_data);
+        PF_PixelFormat format = PF_PixelFormat_INVALID;
+        ERR(worlds->PF_GetPixelFormat(output, &format));
+        if (!err && format != PF_PixelFormat_GPU_BGRA128) err = PF_Err_UNRECOGNIZED_PARAM_TYPE;
+        PF_GPUDeviceInfo info;
+        AEFX_CLR_STRUCT(info);
+        ERR(gpu->GetDeviceInfo(in_data->effect_ref, extra->input->device_index, &info));
+        void* src_mem = nullptr;
+        void* dst_mem = nullptr;
+        ERR(gpu->GetGPUWorldData(in_data->effect_ref, input, &src_mem));
+        ERR(gpu->GetGPUWorldData(in_data->effect_ref, output, &dst_mem));
+
+        if (!err) {
+            const PF_LRect bounds = Union(plan->input_rect, plan->output_rect);
+            glow_profond::metal::GlowMetal::HostFrame src, dst;
+            src.buffer = src_mem;
+            src.width = int(input->width);
+            src.height = int(input->height);
+            src.pitch = int(input->rowbytes / 16);
+            src.dx = int(plan->input_rect.left - bounds.left);
+            src.dy = int(plan->input_rect.top - bounds.top);
+            dst.buffer = dst_mem;
+            dst.width = int(output->width);
+            dst.height = int(output->height);
+            dst.pitch = int(output->rowbytes / 16);
+            dst.dx = int(plan->output_rect.left - bounds.left);
+            dst.dy = int(plan->output_rect.top - bounds.top);
+            const int work_w = int(bounds.right - bounds.left), work_h = int(bounds.bottom - bounds.top);
+            // 8/16 bpc projects get the same colour <= alpha guard as on the CPU.
+            const bool clamp_premult = extra->input->bitdepth < 32;
+            if (!metal->submit_render_premultiplied(info.command_queuePV, src, dst, work_w, work_h, p, clamp_premult)) {
+                err = PF_Err_INTERNAL_STRUCT_DAMAGED;
+            }
+        }
+    }
+    if (input) ERR2(extra->cb->checkin_layer_pixels(in_data->effect_ref, GP_INPUT));
+    return err;
+}
+#endif
+
 }  // namespace
 
 extern "C" DllExport PF_Err PluginDataEntryFunction2(PF_PluginDataPtr inPtr, PF_PluginDataCB2 inPluginDataCallBackPtr,
@@ -888,6 +984,13 @@ extern "C" DllExport PF_Err EffectMain(PF_Cmd cmd, PF_InData* in_data, PF_OutDat
                 return PreRender(in_data, out_data, static_cast<PF_PreRenderExtra*>(extra));
             case PF_Cmd_SMART_RENDER:
                 return SmartRender(in_data, out_data, static_cast<PF_SmartRenderExtra*>(extra));
+#ifdef AE_OS_MAC
+            case PF_Cmd_GPU_DEVICE_SETUP:
+                return GPUDeviceSetup(in_data, out_data, static_cast<PF_GPUDeviceSetupExtra*>(extra));
+            case PF_Cmd_GPU_DEVICE_SETDOWN: return GPUDeviceSetdown(static_cast<PF_GPUDeviceSetdownExtra*>(extra));
+            case PF_Cmd_SMART_RENDER_GPU:
+                return SmartRenderGPU(in_data, out_data, static_cast<PF_SmartRenderExtra*>(extra));
+#endif
             default: return PF_Err_NONE;
         }
     } catch (const std::bad_alloc&) {

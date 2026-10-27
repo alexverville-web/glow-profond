@@ -60,6 +60,18 @@ struct FinishParams {
     float saturation;
     int32_t use_saturation;
 };
+struct PrepareParams {
+    uint32_t src_w, src_h, src_pitch;
+    int32_t dx, dy;
+    uint32_t work_w, work_h;
+    int32_t unmult, gamma, clamp_premult;
+};
+struct CompositeParams {
+    uint32_t dst_w, dst_h, dst_pitch;
+    int32_t dx, dy;
+    uint32_t work_w;
+    int32_t view, screen, gamma, tonemap;
+};
 struct TentTaps {
     int32_t idx[4];
     float w[4];
@@ -176,7 +188,7 @@ Plan make_plan(int W, int H, const GlowParams& p) {
 struct GlowMetal::Impl {
     id<MTLDevice> device = nil;
     id<MTLCommandQueue> queue = nil;
-    id<MTLComputePipelineState> threshold, down, blur_h, blur_v, tent_x, tent_y_add, finish;
+    id<MTLComputePipelineState> threshold, down, blur_h, blur_v, tent_x, tent_y_add, finish, prepare, composite;
 
     id<MTLBuffer> buffer(size_t pixels) {
         return [device newBufferWithLength:std::max<size_t>(pixels, 1) * 16 options:MTLResourceStorageModePrivate];
@@ -320,9 +332,20 @@ GlowMetal::~GlowMetal() = default;
 
 std::unique_ptr<GlowMetal> GlowMetal::create(std::string* error) {
     @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            if (error) *error = "no Metal device";
+            return nullptr;
+        }
+        return create_for_device((__bridge void*)device, error);
+    }
+}
+
+std::unique_ptr<GlowMetal> GlowMetal::create_for_device(void* mtl_device, std::string* error) {
+    @autoreleasepool {
         std::unique_ptr<GlowMetal> g(new GlowMetal);
         Impl& m = *g->impl_;
-        m.device = MTLCreateSystemDefaultDevice();
+        m.device = (__bridge id<MTLDevice>)mtl_device;
         if (!m.device) {
             if (error) *error = "no Metal device";
             return nullptr;
@@ -357,7 +380,10 @@ std::unique_ptr<GlowMetal> GlowMetal::create(std::string* error) {
         m.tent_x = pipeline("tent_x");
         m.tent_y_add = pipeline("tent_y_add");
         m.finish = pipeline("finish");
-        if (!m.threshold || !m.down || !m.blur_h || !m.blur_v || !m.tent_x || !m.tent_y_add || !m.finish) {
+        m.prepare = pipeline("prepare");
+        m.composite = pipeline("composite");
+        if (!m.threshold || !m.down || !m.blur_h || !m.blur_v || !m.tent_x || !m.tent_y_add || !m.finish ||
+            !m.prepare || !m.composite) {
             return nullptr;
         }
         m.queue = [m.device newCommandQueue];
@@ -421,6 +447,96 @@ bool GlowMetal::encode_glow_layer(void* command_buffer, void* src_buffer, void* 
                                   const GlowParams& p) {
     return impl_->encode((__bridge id<MTLCommandBuffer>)command_buffer, (__bridge id<MTLBuffer>)src_buffer,
                          (__bridge id<MTLBuffer>)dst_buffer, width, height, p);
+}
+
+bool GlowMetal::encode_render_premultiplied(void* command_buffer, const HostFrame& src, const HostFrame& dst,
+                                            int work_width, int work_height, const GlowParams& p, bool clamp_premult) {
+    Impl& m = *impl_;
+    id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)command_buffer;
+    const size_t px = size_t(work_width) * size_t(work_height);
+    if (px == 0) return true;
+    id<MTLBuffer> work = m.buffer(px);
+    {
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (!enc) return false;
+        PrepareParams pp{uint32_t(src.width), uint32_t(src.height), uint32_t(src.pitch), src.dx, src.dy,
+                         uint32_t(work_width), uint32_t(work_height), p.unmult ? 1 : 0, p.gamma_correct ? 1 : 0,
+                         clamp_premult ? 1 : 0};
+        [enc setBuffer:(__bridge id<MTLBuffer>)src.buffer offset:0 atIndex:0];
+        [enc setBuffer:work offset:0 atIndex:1];
+        Impl::bytes(enc, pp, 2);
+        Impl::dispatch(enc, m.prepare, uint32_t(work_width), uint32_t(work_height));
+        [enc endEncoding];
+    }
+    id<MTLBuffer> glow = work;  // unused by the Source view
+    if (p.view != View::Source) {
+        glow = m.buffer(px);
+        if (!m.encode(cb, work, glow, work_width, work_height, p)) return false;
+    }
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    if (!enc) return false;
+    const int view = p.view == View::Glow ? 1 : p.view == View::Source ? 2 : p.view == View::Behind ? 3 : 0;
+    CompositeParams cp{uint32_t(dst.width), uint32_t(dst.height), uint32_t(dst.pitch), dst.dx, dst.dy,
+                       uint32_t(work_width), view, p.blend == Blend::Screen ? 1 : 0, p.gamma_correct ? 1 : 0,
+                       p.tonemap ? 1 : 0};
+    [enc setBuffer:work offset:0 atIndex:0];
+    [enc setBuffer:glow offset:0 atIndex:1];
+    [enc setBuffer:(__bridge id<MTLBuffer>)dst.buffer offset:0 atIndex:2];
+    Impl::bytes(enc, cp, 3);
+    Impl::dispatch(enc, m.composite, uint32_t(dst.width), uint32_t(dst.height));
+    [enc endEncoding];
+    return true;
+}
+
+bool GlowMetal::submit_render_premultiplied(void* command_queue, const HostFrame& src, const HostFrame& dst,
+                                            int work_width, int work_height, const GlowParams& p, bool clamp_premult) {
+    @autoreleasepool {
+        id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)command_queue;
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        if (!cb) return false;
+        if (!encode_render_premultiplied((__bridge void*)cb, src, dst, work_width, work_height, p, clamp_premult)) {
+            return false;
+        }
+        [cb commit];
+        return cb.error == nil;
+    }
+}
+
+bool GlowMetal::render_premultiplied(const Image& rgba, const GlowParams& p, Image& out, Timing* timing) {
+    @autoreleasepool {
+        const auto t0 = std::chrono::steady_clock::now();
+        const int W = rgba.width, H = rgba.height;
+        out = Image(W, H, 4);
+        const size_t px = size_t(W) * H;
+        id<MTLBuffer> in = [impl_->device newBufferWithLength:px * 16 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> res = [impl_->device newBufferWithLength:px * 16 options:MTLResourceStorageModeShared];
+        float* f = static_cast<float*>(in.contents);
+        for (size_t i = 0; i < px; ++i) {  // RGBA -> BGRA
+            f[i * 4 + 0] = rgba.data[i * 4 + 2];
+            f[i * 4 + 1] = rgba.data[i * 4 + 1];
+            f[i * 4 + 2] = rgba.data[i * 4 + 0];
+            f[i * 4 + 3] = rgba.data[i * 4 + 3];
+        }
+        HostFrame frame{(__bridge void*)in, W, H, W, 0, 0};
+        HostFrame target{(__bridge void*)res, W, H, W, 0, 0};
+        id<MTLCommandBuffer> cb = [impl_->queue commandBuffer];
+        if (!encode_render_premultiplied((__bridge void*)cb, frame, target, W, H, p, false)) return false;
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status != MTLCommandBufferStatusCompleted) return false;
+        const float* r = static_cast<const float*>(res.contents);
+        for (size_t i = 0; i < px; ++i) {
+            out.data[i * 4 + 0] = r[i * 4 + 2];
+            out.data[i * 4 + 1] = r[i * 4 + 1];
+            out.data[i * 4 + 2] = r[i * 4 + 0];
+            out.data[i * 4 + 3] = r[i * 4 + 3];
+        }
+        if (timing) {
+            timing->gpu_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
+            timing->total_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        }
+        return true;
+    }
 }
 
 }  // namespace metal

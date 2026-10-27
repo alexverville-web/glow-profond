@@ -27,6 +27,8 @@ public:
     // Null (with *error set) if there is no Metal device or the kernels
     // fail to compile.
     static std::unique_ptr<GlowMetal> create(std::string* error);
+    // Same, on a given MTLDevice (the host's, e.g. After Effects' GPU device).
+    static std::unique_ptr<GlowMetal> create_for_device(void* mtl_device, std::string* error);
     ~GlowMetal();
 
     // Whether this path renders p exactly like glow_layer() (with the given
@@ -42,6 +44,29 @@ public:
     // For the After Effects GPU path.
     bool encode_glow_layer(void* command_buffer, void* src_buffer, void* dst_buffer, int width, int height,
                            const GlowParams& p);
+
+    // A host frame: MTLBuffer of BGRA float4 premultiplied pixels, rows
+    // `pitch` pixels apart, placed at (dx, dy) in the work area.
+    struct HostFrame {
+        void* buffer = nullptr;
+        int width = 0, height = 0, pitch = 0;
+        int dx = 0, dy = 0;
+    };
+
+    // The whole render_premultiplied() on the GPU (no depth, dirt or
+    // neighbours: see supports()): src is read into a work area of
+    // work_width x work_height, the glow computed there, and dst written
+    // from it. clamp_premult: 8/16-bit project, cap colour at alpha.
+    bool encode_render_premultiplied(void* command_buffer, const HostFrame& src, const HostFrame& dst,
+                                     int work_width, int work_height, const GlowParams& p, bool clamp_premult);
+
+    // encode_render_premultiplied() in a new command buffer of the host's
+    // MTLCommandQueue, committed (not waited on: the host orders its queue).
+    bool submit_render_premultiplied(void* command_queue, const HostFrame& src, const HostFrame& dst,
+                                     int work_width, int work_height, const GlowParams& p, bool clamp_premult);
+
+    // Test helper: render_premultiplied(rgba, p) through the GPU path.
+    bool render_premultiplied(const Image& rgba, const GlowParams& p, Image& out, Timing* timing = nullptr);
 
 private:
     GlowMetal();
