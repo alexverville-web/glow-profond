@@ -36,7 +36,7 @@ suit est notre choix de conception.
 ## Pipeline
 
 1. Unmult optionnel, puis linéarisation (sRGB → linéaire) si `gamma_correct`.
-2. Seuil doux sur max(R,G,B) : `soft = clamp(br - t + k, 0, 2k)² / 4k`,
+2. Seuil doux sur max(R,G,B), genou `k = t × threshold_smooth` (t = 0 laisse passer l'image intacte) : `soft = clamp(br - t + k, 0, 2k)² / 4k`,
    facteur = `max(soft, br - t) / br`.
 3. Pyramide : niveau k à résolution 1/2^k, flou gaussien de σ_k = σ₀·2^k
    (donc σ constant en pixels du niveau : coût quasi indépendant du rayon).
