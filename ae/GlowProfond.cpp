@@ -21,7 +21,8 @@
 #include "GlowProfond_Version.h"
 #include "glow_profond/glow.hpp"
 
-static_assert(GP_OUT_FLAGS == (PF_OutFlag_DEEP_COLOR_AWARE | PF_OutFlag_I_EXPAND_BUFFER | PF_OutFlag_WIDE_TIME_INPUT),
+static_assert(GP_OUT_FLAGS == (PF_OutFlag_DEEP_COLOR_AWARE | PF_OutFlag_I_EXPAND_BUFFER | PF_OutFlag_WIDE_TIME_INPUT |
+                               PF_OutFlag_SEND_UPDATE_PARAMS_UI),
               "PiPL out flags out of sync with GlobalSetup");
 static_assert(GP_OUT_FLAGS_2 == (PF_OutFlag2_FLOAT_COLOR_AWARE | PF_OutFlag2_SUPPORTS_SMART_RENDER |
                                  PF_OutFlag2_SUPPORTS_THREADED_RENDERING |
@@ -37,58 +38,68 @@ namespace {
 using glow_profond::GlowParams;
 using glow_profond::Image;
 
-// Parameter order in the Effect Controls panel.
+// Parameter order in the Effect Controls panel: the essentials at the top,
+// every extra behind an "Enable" checkbox in its own (collapsed) group.
 enum {
     GP_INPUT = 0,
     GP_PRESET,
     GP_RADIUS,
     GP_EXPOSURE,
-    GP_SPREAD,
+    GP_THRESHOLD,
+    GP_SPREAD_AMOUNT,
     GP_SATURATION,
     GP_BLEND,
-    GP_INPUT_GROUP,
-    GP_THRESHOLD,
-    GP_THRESHOLD_SMOOTH,
-    GP_UNMULT,
-    GP_TEMPORAL,
-    GP_INPUT_GROUP_END,
-    GP_SHAPE_GROUP,
-    GP_ASPECT,
-    GP_RADIUS_R,
-    GP_RADIUS_G,
-    GP_RADIUS_B,
-    GP_SHAPE_GROUP_END,
+    GP_VIEW,
     GP_TINT_GROUP,
     GP_TINT_MODE,
     GP_TINT_CORE,
     GP_TINT_MID,
     GP_TINT_HALO,
     GP_TINT_GROUP_END,
+    GP_CHROMA_GROUP,
+    GP_CHROMA_ENABLE,
+    GP_RADIUS_R,
+    GP_RADIUS_G,
+    GP_RADIUS_B,
+    GP_CHROMA_GROUP_END,
+    GP_ANAMORPHIC_GROUP,
+    GP_ANAMORPHIC_ENABLE,
+    GP_ASPECT,
+    GP_ANAMORPHIC_GROUP_END,
     GP_DIRT_GROUP,
+    GP_DIRT_ENABLE,
     GP_DIRT_LAYER,
     GP_DIRT_AMOUNT,
     GP_DIRT_GROUP_END,
     GP_DEPTH_GROUP,
+    GP_DEPTH_ENABLE,
     GP_DEPTH_LAYER,
     GP_DEPTH_SPREAD,
     GP_OCCLUSION,
     GP_DEPTH_INVERT,
     GP_DEPTH_GROUP_END,
+    GP_FLICKER_GROUP,
+    GP_FLICKER_ENABLE,
+    GP_TEMPORAL,
+    GP_FLICKER_GROUP_END,
     GP_RENDER_GROUP,
+    GP_THRESHOLD_SMOOTH,
+    GP_UNMULT,
     GP_GAMMA,
     GP_TONEMAP,
     GP_BASE_SIGMA,
     GP_DOWNSAMPLE,
     GP_RENDER_GROUP_END,
-    GP_VIEW,
     GP_NUM_PARAMS
 };
 
-// Disk IDs are saved in projects: never renumber, only append.
+// Disk IDs are saved in projects: never renumber, only append. IDs of
+// parameters that left the panel (the raw falloff exponent, the old Input
+// and Shape groups) stay reserved.
 enum {
     ID_RADIUS = 1,
     ID_EXPOSURE,
-    ID_SPREAD,
+    ID_SPREAD,  // v0.1-0.3 raw exponent, replaced by ID_SPREAD_AMOUNT
     ID_INPUT_GROUP,
     ID_THRESHOLD,
     ID_THRESHOLD_SMOOTH,
@@ -128,7 +139,20 @@ enum {
     ID_DEPTH_SPREAD,
     ID_OCCLUSION,
     ID_DEPTH_INVERT,
-    ID_DEPTH_GROUP_END
+    ID_DEPTH_GROUP_END,
+    // v0.4
+    ID_SPREAD_AMOUNT,
+    ID_CHROMA_GROUP,
+    ID_CHROMA_ENABLE,
+    ID_CHROMA_GROUP_END,
+    ID_ANAMORPHIC_GROUP,
+    ID_ANAMORPHIC_ENABLE,
+    ID_ANAMORPHIC_GROUP_END,
+    ID_DIRT_ENABLE,
+    ID_DEPTH_ENABLE,
+    ID_FLICKER_GROUP,
+    ID_FLICKER_ENABLE,
+    ID_FLICKER_GROUP_END
 };
 
 enum { TINT_NONE = 1, TINT_TWO, TINT_THREE };
@@ -136,6 +160,10 @@ enum { VIEW_FINAL = 1, VIEW_GLOW, VIEW_SOURCE, VIEW_BEHIND };
 enum { BLEND_ADD = 1, BLEND_SCREEN };
 enum { PRESET_CUSTOM = 1, PRESET_NEON, PRESET_SOFT_SUN, PRESET_CINE, PRESET_ANAMORPHIC, PRESET_TEXT, PRESET_SUBTLE,
        PRESET_COUNT = PRESET_SUBTLE };
+
+// Spread (0-100 %, more = wider) to the core's falloff exponent: 100 % is
+// 1/r (widest), 50 % 1/r^2, 0 % 1/r^3 (tightest).
+float SpreadToExponent(float percent) { return 3.0f - 2.0f * std::clamp(percent, 0.0f, 100.0f) / 100.0f; }
 
 // Checkout ids for the extra layer requests (distinct from parameter indices).
 enum { CHECKOUT_PREV = 1000, CHECKOUT_NEXT, CHECKOUT_DIRT, CHECKOUT_DEPTH };
@@ -192,17 +220,17 @@ float ToFloat(const PF_ParamDef& def) { return static_cast<float>(def.u.fs_d.val
 
 // Reads every parameter at the current time. Pixel sizes are scaled to the
 // render resolution, so a half-resolution preview matches the full render.
-// invert_depth, when given, receives the "Inverser la profondeur" checkbox,
+// invert_depth, when given, receives the "Invert Depth" checkbox,
 // which is a host-side option (not a GlowParams field).
 PF_Err ReadParams(PF_InData* in_data, PF_OutData* out_data, GlowParams& p, bool* invert_depth = nullptr) {
     PF_Err err = PF_Err_NONE, err2 = PF_Err_NONE;
-    static const int kValueParams[] = {GP_RADIUS,    GP_EXPOSURE,  GP_SPREAD,     GP_THRESHOLD,
-                                       GP_THRESHOLD_SMOOTH, GP_UNMULT, GP_ASPECT, GP_RADIUS_R,
-                                       GP_RADIUS_G,  GP_RADIUS_B,  GP_TINT_MODE,  GP_TINT_CORE,
-                                       GP_TINT_MID,  GP_TINT_HALO, GP_GAMMA,      GP_TONEMAP,
-                                       GP_BASE_SIGMA, GP_DOWNSAMPLE, GP_VIEW,       GP_SATURATION,
-                                       GP_BLEND,     GP_TEMPORAL,  GP_DIRT_AMOUNT, GP_DEPTH_SPREAD,
-                                       GP_OCCLUSION, GP_DEPTH_INVERT};
+    static const int kValueParams[] = {
+        GP_RADIUS,       GP_EXPOSURE,     GP_THRESHOLD,     GP_SPREAD_AMOUNT, GP_SATURATION,   GP_BLEND,
+        GP_VIEW,         GP_TINT_MODE,    GP_TINT_CORE,     GP_TINT_MID,      GP_TINT_HALO,    GP_CHROMA_ENABLE,
+        GP_RADIUS_R,     GP_RADIUS_G,     GP_RADIUS_B,      GP_ANAMORPHIC_ENABLE, GP_ASPECT,   GP_DIRT_ENABLE,
+        GP_DIRT_AMOUNT,  GP_DEPTH_ENABLE, GP_DEPTH_SPREAD,  GP_OCCLUSION,     GP_DEPTH_INVERT, GP_FLICKER_ENABLE,
+        GP_TEMPORAL,     GP_THRESHOLD_SMOOTH, GP_UNMULT,    GP_GAMMA,         GP_TONEMAP,      GP_BASE_SIGMA,
+        GP_DOWNSAMPLE};
     PF_ParamDef defs[GP_NUM_PARAMS];
     bool checked_out[GP_NUM_PARAMS] = {};
     for (int index : kValueParams) {
@@ -215,26 +243,31 @@ PF_Err ReadParams(PF_InData* in_data, PF_OutData* out_data, GlowParams& p, bool*
     if (!err) {
         const float scale = static_cast<float>(in_data->downsample_x.num) /
                             static_cast<float>(std::max<A_long>(in_data->downsample_x.den, 1));
+        auto on = [&](int index) { return defs[index].u.bd.value != 0; };
         p.radius = ToFloat(defs[GP_RADIUS]) * scale;
         p.base_sigma = ToFloat(defs[GP_BASE_SIGMA]) * scale;
         p.exposure = ToFloat(defs[GP_EXPOSURE]);
-        p.spread = ToFloat(defs[GP_SPREAD]);
+        p.spread = SpreadToExponent(ToFloat(defs[GP_SPREAD_AMOUNT]));
         p.threshold = ToFloat(defs[GP_THRESHOLD]);
         p.threshold_smooth = ToFloat(defs[GP_THRESHOLD_SMOOTH]);
-        p.unmult = defs[GP_UNMULT].u.bd.value != 0;
-        p.aspect = ToFloat(defs[GP_ASPECT]);
-        p.rgb_radius = {ToFloat(defs[GP_RADIUS_R]), ToFloat(defs[GP_RADIUS_G]), ToFloat(defs[GP_RADIUS_B])};
-        p.gamma_correct = defs[GP_GAMMA].u.bd.value != 0;
-        p.tonemap = defs[GP_TONEMAP].u.bd.value != 0;
+        p.unmult = on(GP_UNMULT);
+        p.gamma_correct = on(GP_GAMMA);
+        p.tonemap = on(GP_TONEMAP);
         p.downsample = 1 << std::clamp<A_long>(defs[GP_DOWNSAMPLE].u.pd.value - 1, 0, 3);
         p.saturation = ToFloat(defs[GP_SATURATION]) / 100.0f;
         p.blend = defs[GP_BLEND].u.pd.value == BLEND_SCREEN ? glow_profond::Blend::Screen : glow_profond::Blend::Add;
-        p.temporal_smooth = ToFloat(defs[GP_TEMPORAL]) / 100.0f;
-        p.dirt_amount = ToFloat(defs[GP_DIRT_AMOUNT]) / 100.0f;
-        // Only used when a depth layer is set (see SmartRender).
-        p.depth_spread = ToFloat(defs[GP_DEPTH_SPREAD]);
-        p.occlusion = defs[GP_OCCLUSION].u.bd.value != 0;
-        if (invert_depth) *invert_depth = defs[GP_DEPTH_INVERT].u.bd.value != 0;
+        // Extras only count while their group is enabled.
+        p.aspect = on(GP_ANAMORPHIC_ENABLE) ? ToFloat(defs[GP_ASPECT]) : 1.0f;
+        p.rgb_radius = on(GP_CHROMA_ENABLE)
+                           ? glow_profond::Rgb{ToFloat(defs[GP_RADIUS_R]), ToFloat(defs[GP_RADIUS_G]),
+                                               ToFloat(defs[GP_RADIUS_B])}
+                           : glow_profond::Rgb{1.0f, 1.0f, 1.0f};
+        p.temporal_smooth = on(GP_FLICKER_ENABLE) ? ToFloat(defs[GP_TEMPORAL]) / 100.0f : 0.0f;
+        p.dirt_amount = on(GP_DIRT_ENABLE) ? ToFloat(defs[GP_DIRT_AMOUNT]) / 100.0f : 0.0f;
+        // Also need a depth layer (see SmartRender).
+        p.depth_spread = on(GP_DEPTH_ENABLE) ? ToFloat(defs[GP_DEPTH_SPREAD]) : 0.0f;
+        p.occlusion = on(GP_DEPTH_ENABLE) && on(GP_OCCLUSION);
+        if (invert_depth) *invert_depth = on(GP_DEPTH_INVERT);
 
         switch (defs[GP_VIEW].u.pd.value) {
             case VIEW_GLOW: p.view = glow_profond::View::Glow; break;
@@ -372,7 +405,7 @@ void WritePixels(const Image& img, int dx, int dy, float max_value, bool quantiz
 }
 
 PF_Err About(PF_InData* in_data, PF_OutData* out_data) {
-    PF_SPRINTF(out_data->return_msg, "%s v%d.%d.%d\rGimmick Studio\rGlow a falloff physique (1/r^p).", GP_NAME,
+    PF_SPRINTF(out_data->return_msg, "%s v%d.%d.%d\rGimmick Studio\rPhysically based glow (1/r^p falloff).", GP_NAME,
                GP_MAJOR_VERSION, GP_MINOR_VERSION, GP_BUG_VERSION);
     return PF_Err_NONE;
 }
@@ -387,138 +420,159 @@ PF_Err GlobalSetup(PF_OutData* out_data) {
 PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data) {
     PF_Err err = PF_Err_NONE;
     PF_ParamDef def;
+    const PF_ParamFlags supervised = PF_ParamFlag_SUPERVISE;
+    auto group = [&](const char* name, A_long id) {
+        AEFX_CLR_STRUCT(def);
+        def.flags = PF_ParamFlag_START_COLLAPSED;
+        PF_ADD_TOPIC(name, id);
+        return err;
+    };
+    auto end_group = [&](A_long id) {
+        AEFX_CLR_STRUCT(def);
+        PF_END_TOPIC(id);
+        return err;
+    };
 
+    // Defaults: a white shape glows like with Deep Glow's defaults (fitted
+    // on renders of both), with a continuous radius.
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUPX("Preset", PRESET_COUNT, PRESET_CUSTOM,
-                  "Personnalise|Neon|Soleil doux|Cine|Anamorphique|Texte lumineux|Bloom subtil",
-                  PF_ParamFlag_SUPERVISE | PF_ParamFlag_CANNOT_TIME_VARY, ID_PRESET);
+                  "Custom|Neon|Soft Sun|Cinematic|Anamorphic|Glowing Text|Subtle Bloom",
+                  supervised | PF_ParamFlag_CANNOT_TIME_VARY, ID_PRESET);
     AEFX_CLR_STRUCT(def);
-    PF_ADD_FLOAT_SLIDERX("Rayon", 0, 4000, 0, 1000, 400, PF_Precision_TENTHS, 0, 0, ID_RADIUS);
+    PF_ADD_FLOAT_SLIDERX("Radius", 0, 4000, 0, 1000, 160, PF_Precision_TENTHS, 0, 0, ID_RADIUS);
     AEFX_CLR_STRUCT(def);
-    PF_ADD_FLOAT_SLIDERX("Exposition", -10, 10, -4, 4, 0, PF_Precision_HUNDREDTHS, 0, 0, ID_EXPOSURE);
+    PF_ADD_FLOAT_SLIDERX("Exposure", -10, 10, -5, 5, -1.25, PF_Precision_HUNDREDTHS, 0, 0, ID_EXPOSURE);
     AEFX_CLR_STRUCT(def);
-    PF_ADD_FLOAT_SLIDERX("Diffusion (falloff)", 0.5, 4, 1, 3, 2, PF_Precision_HUNDREDTHS, 0, 0, ID_SPREAD);
+    PF_ADD_FLOAT_SLIDERX("Threshold", 0, 100, 0, 1, 0, PF_Precision_HUNDREDTHS, 0, 0, ID_THRESHOLD);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("Spread", 0, 100, 0, 100, 57.5, PF_Precision_TENTHS, PF_ValueDisplayFlag_PERCENT, 0,
+                         ID_SPREAD_AMOUNT);
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Saturation", 0, 300, 0, 200, 100, PF_Precision_INTEGER, PF_ValueDisplayFlag_PERCENT, 0,
                          ID_SATURATION);
     AEFX_CLR_STRUCT(def);
-    PF_ADD_POPUP("Mode de fusion", 2, BLEND_ADD, "Ajout|Ecran", ID_BLEND);
+    PF_ADD_POPUP("Blend Mode", 2, BLEND_ADD, "Add|Screen", ID_BLEND);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_POPUP("View", 4, VIEW_FINAL, "Final|Glow Only|Source|Glow Behind", ID_VIEW);
 
+    ERR(group("Color Tint", ID_TINT_GROUP));
     AEFX_CLR_STRUCT(def);
-    PF_ADD_TOPIC("Entree", ID_INPUT_GROUP);
+    PF_ADD_POPUPX("Tint", 3, TINT_NONE, "Off|2 Colors|3 Colors", supervised, ID_TINT_MODE);
     AEFX_CLR_STRUCT(def);
-    PF_ADD_FLOAT_SLIDERX("Seuil", 0, 100, 0, 2, 0, PF_Precision_HUNDREDTHS, 0, 0, ID_THRESHOLD);
+    PF_ADD_COLOR("Core Color", 255, 255, 255, ID_TINT_CORE);
     AEFX_CLR_STRUCT(def);
-    PF_ADD_FLOAT_SLIDERX("Douceur du seuil", 0, 1, 0, 1, 0.5, PF_Precision_HUNDREDTHS, 0, 0, ID_THRESHOLD_SMOOTH);
+    PF_ADD_COLOR("Middle Color", 255, 102, 204, ID_TINT_MID);
     AEFX_CLR_STRUCT(def);
-    PF_ADD_CHECKBOXX("Unmult (alpha = luma)", FALSE, 0, ID_UNMULT);
-    AEFX_CLR_STRUCT(def);
-    PF_ADD_FLOAT_SLIDERX("Anti-scintillement", 0, 100, 0, 100, 0, PF_Precision_INTEGER, PF_ValueDisplayFlag_PERCENT,
-                         0, ID_TEMPORAL);
-    AEFX_CLR_STRUCT(def);
-    PF_END_TOPIC(ID_INPUT_GROUP_END);
+    PF_ADD_COLOR("Halo Color", 77, 77, 255, ID_TINT_HALO);
+    ERR(end_group(ID_TINT_GROUP_END));
 
+    ERR(group("Chromatic Aberration", ID_CHROMA_GROUP));
     AEFX_CLR_STRUCT(def);
-    PF_ADD_TOPIC("Forme", ID_SHAPE_GROUP);
+    PF_ADD_CHECKBOXX("Enable Chromatic Aberration", FALSE, supervised, ID_CHROMA_ENABLE);
     AEFX_CLR_STRUCT(def);
-    PF_ADD_FLOAT_SLIDERX("Ratio d'aspect", 0.1, 10, 0.25, 4, 1, PF_Precision_HUNDREDTHS, 0, 0, ID_ASPECT);
+    PF_ADD_FLOAT_SLIDERX("Red Radius", 0, 4, 0.5, 2, 1.15, PF_Precision_HUNDREDTHS, 0, 0, ID_RADIUS_R);
     AEFX_CLR_STRUCT(def);
-    PF_ADD_FLOAT_SLIDERX("Rayon rouge", 0, 4, 0.5, 2, 1, PF_Precision_HUNDREDTHS, 0, 0, ID_RADIUS_R);
+    PF_ADD_FLOAT_SLIDERX("Green Radius", 0, 4, 0.5, 2, 1, PF_Precision_HUNDREDTHS, 0, 0, ID_RADIUS_G);
     AEFX_CLR_STRUCT(def);
-    PF_ADD_FLOAT_SLIDERX("Rayon vert", 0, 4, 0.5, 2, 1, PF_Precision_HUNDREDTHS, 0, 0, ID_RADIUS_G);
-    AEFX_CLR_STRUCT(def);
-    PF_ADD_FLOAT_SLIDERX("Rayon bleu", 0, 4, 0.5, 2, 1, PF_Precision_HUNDREDTHS, 0, 0, ID_RADIUS_B);
-    AEFX_CLR_STRUCT(def);
-    PF_END_TOPIC(ID_SHAPE_GROUP_END);
+    PF_ADD_FLOAT_SLIDERX("Blue Radius", 0, 4, 0.5, 2, 0.85, PF_Precision_HUNDREDTHS, 0, 0, ID_RADIUS_B);
+    ERR(end_group(ID_CHROMA_GROUP_END));
 
+    ERR(group("Anamorphic", ID_ANAMORPHIC_GROUP));
     AEFX_CLR_STRUCT(def);
-    PF_ADD_TOPIC("Teinte", ID_TINT_GROUP);
+    PF_ADD_CHECKBOXX("Enable Anamorphic", FALSE, supervised, ID_ANAMORPHIC_ENABLE);
     AEFX_CLR_STRUCT(def);
-    PF_ADD_POPUP("Mode de teinte", 3, TINT_NONE, "Aucune|2 couleurs|3 couleurs", ID_TINT_MODE);
-    AEFX_CLR_STRUCT(def);
-    PF_ADD_COLOR("Couleur du coeur", 255, 255, 255, ID_TINT_CORE);
-    AEFX_CLR_STRUCT(def);
-    PF_ADD_COLOR("Couleur du milieu", 255, 102, 204, ID_TINT_MID);
-    AEFX_CLR_STRUCT(def);
-    PF_ADD_COLOR("Couleur du halo", 77, 77, 255, ID_TINT_HALO);
-    AEFX_CLR_STRUCT(def);
-    PF_END_TOPIC(ID_TINT_GROUP_END);
+    PF_ADD_FLOAT_SLIDERX("Aspect Ratio", 0.1, 10, 0.25, 8, 4, PF_Precision_HUNDREDTHS, 0, 0, ID_ASPECT);
+    ERR(end_group(ID_ANAMORPHIC_GROUP_END));
 
+    ERR(group("Lens Dirt", ID_DIRT_GROUP));
     AEFX_CLR_STRUCT(def);
-    PF_ADD_TOPIC("Salete de lentille", ID_DIRT_GROUP);
+    PF_ADD_CHECKBOXX("Enable Lens Dirt", FALSE, supervised, ID_DIRT_ENABLE);
     AEFX_CLR_STRUCT(def);
-    PF_ADD_LAYER("Texture", PF_LayerDefault_NONE, ID_DIRT_LAYER);
+    PF_ADD_LAYER("Dirt Texture", PF_LayerDefault_NONE, ID_DIRT_LAYER);
     AEFX_CLR_STRUCT(def);
-    PF_ADD_FLOAT_SLIDERX("Intensite salete", 0, 1000, 0, 200, 100, PF_Precision_INTEGER, PF_ValueDisplayFlag_PERCENT,
-                         0, ID_DIRT_AMOUNT);
-    AEFX_CLR_STRUCT(def);
-    PF_END_TOPIC(ID_DIRT_GROUP_END);
+    PF_ADD_FLOAT_SLIDERX("Dirt Amount", 0, 1000, 0, 200, 100, PF_Precision_INTEGER, PF_ValueDisplayFlag_PERCENT, 0,
+                         ID_DIRT_AMOUNT);
+    ERR(end_group(ID_DIRT_GROUP_END));
 
+    ERR(group("Depth", ID_DEPTH_GROUP));
     AEFX_CLR_STRUCT(def);
-    PF_ADD_TOPIC("Profondeur", ID_DEPTH_GROUP);
+    PF_ADD_CHECKBOXX("Enable Depth", FALSE, supervised, ID_DEPTH_ENABLE);
     AEFX_CLR_STRUCT(def);
-    PF_ADD_LAYER("Calque de profondeur", PF_LayerDefault_NONE, ID_DEPTH_LAYER);
+    PF_ADD_LAYER("Depth Layer", PF_LayerDefault_NONE, ID_DEPTH_LAYER);
     AEFX_CLR_STRUCT(def);
-    PF_ADD_FLOAT_SLIDERX("Etalement selon la profondeur", 0, 1, 0, 1, 0, PF_Precision_HUNDREDTHS, 0, 0,
-                         ID_DEPTH_SPREAD);
+    PF_ADD_FLOAT_SLIDERX("Depth Spread", 0, 1, 0, 1, 0.5, PF_Precision_HUNDREDTHS, 0, 0, ID_DEPTH_SPREAD);
     AEFX_CLR_STRUCT(def);
     PF_ADD_CHECKBOXX("Occlusion", FALSE, 0, ID_OCCLUSION);
     AEFX_CLR_STRUCT(def);
-    PF_ADD_CHECKBOXX("Inverser la profondeur (blanc = proche)", FALSE, 0, ID_DEPTH_INVERT);
-    AEFX_CLR_STRUCT(def);
-    PF_END_TOPIC(ID_DEPTH_GROUP_END);
+    PF_ADD_CHECKBOXX("Invert Depth (White = Near)", FALSE, 0, ID_DEPTH_INVERT);
+    ERR(end_group(ID_DEPTH_GROUP_END));
 
+    ERR(group("Anti-Flicker", ID_FLICKER_GROUP));
     AEFX_CLR_STRUCT(def);
-    PF_ADD_TOPIC("Rendu", ID_RENDER_GROUP);
+    PF_ADD_CHECKBOXX("Enable Anti-Flicker", FALSE, supervised, ID_FLICKER_ENABLE);
     AEFX_CLR_STRUCT(def);
-    PF_ADD_CHECKBOXX("Correction gamma", TRUE, 0, ID_GAMMA);
-    AEFX_CLR_STRUCT(def);
-    PF_ADD_CHECKBOXX("Tonemap ACES", FALSE, 0, ID_TONEMAP);
-    AEFX_CLR_STRUCT(def);
-    PF_ADD_FLOAT_SLIDERX("Sigma de base", 0.5, 8, 0.5, 4, 1.5, PF_Precision_HUNDREDTHS, 0, 0, ID_BASE_SIGMA);
-    AEFX_CLR_STRUCT(def);
-    PF_ADD_POPUP("Qualite", 4, 1, "Maximale (1x)|Haute (2x)|Moyenne (4x)|Brouillon (8x)", ID_DOWNSAMPLE);
-    AEFX_CLR_STRUCT(def);
-    PF_END_TOPIC(ID_RENDER_GROUP_END);
+    PF_ADD_FLOAT_SLIDERX("Smoothing", 0, 100, 0, 100, 50, PF_Precision_INTEGER, PF_ValueDisplayFlag_PERCENT, 0,
+                         ID_TEMPORAL);
+    ERR(end_group(ID_FLICKER_GROUP_END));
 
+    ERR(group("Advanced", ID_RENDER_GROUP));
     AEFX_CLR_STRUCT(def);
-    PF_ADD_POPUP("Affichage", 4, VIEW_FINAL, "Resultat final|Glow seul|Source|Glow derriere", ID_VIEW);
+    PF_ADD_FLOAT_SLIDERX("Threshold Smoothness", 0, 1, 0, 1, 0.5, PF_Precision_HUNDREDTHS, 0, 0,
+                         ID_THRESHOLD_SMOOTH);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_CHECKBOXX("Unmultiply (Black = Transparent)", FALSE, 0, ID_UNMULT);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_CHECKBOXX("Linear Light (Gamma Correct)", TRUE, 0, ID_GAMMA);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_CHECKBOXX("ACES Tonemap", FALSE, 0, ID_TONEMAP);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("Core Size", 0.5, 8, 0.5, 4, 1.5, PF_Precision_HUNDREDTHS, 0, 0, ID_BASE_SIGMA);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_POPUP("Quality", 4, 1, "Full|High (1/2)|Medium (1/4)|Draft (1/8)", ID_DOWNSAMPLE);
+    ERR(end_group(ID_RENDER_GROUP_END));
 
     out_data->num_params = GP_NUM_PARAMS;
     return err;
 }
 
-// What a preset sets. Everything else (view, quality, dirt, anti-flicker,
-// unmult, gamma) is left as the user had it.
+// What a preset sets. View, quality, lens dirt, depth, anti-flicker, unmult
+// and gamma are left as the user had them.
 struct Preset {
-    float radius, exposure, spread, saturation;  // saturation in %
+    float radius, exposure, spread, saturation;  // spread and saturation in %
     A_long blend;
-    float threshold, threshold_smooth, aspect;
+    float threshold, threshold_smooth;
+    bool anamorphic;
+    float aspect;
+    bool chroma;
     float rgb_radius[3];
     A_long tint_mode;
     A_u_char core[3], mid[3], halo[3];
     bool tonemap;
 };
 
-// Indexed by PRESET_* - 2 (Personnalise sets nothing).
+// Indexed by PRESET_* - 2 (Custom sets nothing). Weights are per octave, so
+// big radii add light: wide presets use lower exposures. Thresholds stay
+// below 0.7 so they still catch highlights in ordinary (SDR) footage.
+// Checked on build-mac/test/presets_v04.png.
 const Preset kPresets[] = {
     // Neon: tight, saturated, colour kept.
-    {250, 0.5f, 2.2f, 140, BLEND_ADD, 0.3f, 0.5f, 1, {1, 1, 1}, TINT_NONE,
+    {120, -0.75f, 50, 140, BLEND_ADD, 0.3f, 0.5f, false, 4, false, {1.15f, 1, 0.85f}, TINT_NONE,
      {255, 255, 255}, {255, 102, 204}, {77, 77, 255}, false},
-    // Soleil doux: huge warm halo, screened so whites hold.
-    {800, -0.5f, 1.6f, 90, BLEND_SCREEN, 0.6f, 0.8f, 1, {1, 1, 1}, TINT_TWO,
+    // Soft Sun: huge warm halo, screened so whites hold.
+    {500, -1.75f, 70, 90, BLEND_SCREEN, 0.4f, 0.8f, false, 4, false, {1.15f, 1, 0.85f}, TINT_TWO,
      {255, 250, 235}, {255, 200, 140}, {255, 170, 90}, true},
-    // Cine: highlights only, a hint of chromatic spread, ACES.
-    {500, 0, 2, 100, BLEND_ADD, 0.8f, 0.6f, 1, {1.15f, 1, 0.85f}, TINT_NONE,
+    // Cinematic: highlights only, a hint of chromatic spread, ACES.
+    {300, -1.0f, 55, 100, BLEND_ADD, 0.5f, 0.6f, false, 4, true, {1.15f, 1, 0.85f}, TINT_NONE,
      {255, 255, 255}, {255, 102, 204}, {77, 77, 255}, true},
-    // Anamorphique: wide horizontal streak, blue halo.
-    {600, 0, 2, 120, BLEND_ADD, 0.7f, 0.5f, 6, {1, 1, 1}, TINT_TWO,
+    // Anamorphic: wide horizontal streak, blue halo.
+    {400, -0.75f, 55, 120, BLEND_ADD, 0.4f, 0.5f, true, 6, false, {1.15f, 1, 0.85f}, TINT_TWO,
      {255, 255, 255}, {160, 190, 255}, {80, 140, 255}, true},
-    // Texte lumineux: whole shape glows, close and bright.
-    {120, 1, 2.4f, 120, BLEND_ADD, 0, 0.5f, 1, {1, 1, 1}, TINT_NONE,
+    // Glowing Text: whole shape glows, close and bright.
+    {100, -0.5f, 50, 120, BLEND_ADD, 0, 0.5f, false, 4, false, {1.15f, 1, 0.85f}, TINT_NONE,
      {255, 255, 255}, {255, 102, 204}, {77, 77, 255}, false},
-    // Bloom subtil: a soft lift of the brightest areas.
-    {300, -2, 1.8f, 100, BLEND_SCREEN, 0.9f, 0.5f, 1, {1, 1, 1}, TINT_NONE,
+    // Subtle Bloom: a soft lift of the brightest areas.
+    {250, -2.0f, 60, 100, BLEND_SCREEN, 0.6f, 0.5f, false, 4, false, {1.15f, 1, 0.85f}, TINT_NONE,
      {255, 255, 255}, {255, 102, 204}, {77, 77, 255}, false},
 };
 static_assert(sizeof(kPresets) / sizeof(kPresets[0]) == PRESET_COUNT - 1, "one entry per preset");
@@ -537,6 +591,10 @@ PF_Err UserChangedParam(PF_ParamDef* params[], const PF_UserChangedParamExtra* e
         params[index]->u.pd.value = v;
         params[index]->uu.change_flags |= PF_ChangeFlag_CHANGED_VALUE;
     };
+    auto set_check = [&](int index, bool v) {
+        params[index]->u.bd.value = v;
+        params[index]->uu.change_flags |= PF_ChangeFlag_CHANGED_VALUE;
+    };
     auto set_color = [&](int index, const A_u_char (&c)[3]) {
         params[index]->u.cd.value.red = c[0];
         params[index]->u.cd.value.green = c[1];
@@ -546,12 +604,14 @@ PF_Err UserChangedParam(PF_ParamDef* params[], const PF_UserChangedParamExtra* e
     };
     set_float(GP_RADIUS, pr.radius);
     set_float(GP_EXPOSURE, pr.exposure);
-    set_float(GP_SPREAD, pr.spread);
+    set_float(GP_SPREAD_AMOUNT, pr.spread);
     set_float(GP_SATURATION, pr.saturation);
     set_popup(GP_BLEND, pr.blend);
     set_float(GP_THRESHOLD, pr.threshold);
     set_float(GP_THRESHOLD_SMOOTH, pr.threshold_smooth);
+    set_check(GP_ANAMORPHIC_ENABLE, pr.anamorphic);
     set_float(GP_ASPECT, pr.aspect);
+    set_check(GP_CHROMA_ENABLE, pr.chroma);
     set_float(GP_RADIUS_R, pr.rgb_radius[0]);
     set_float(GP_RADIUS_G, pr.rgb_radius[1]);
     set_float(GP_RADIUS_B, pr.rgb_radius[2]);
@@ -559,9 +619,39 @@ PF_Err UserChangedParam(PF_ParamDef* params[], const PF_UserChangedParamExtra* e
     set_color(GP_TINT_CORE, pr.core);
     set_color(GP_TINT_MID, pr.mid);
     set_color(GP_TINT_HALO, pr.halo);
-    params[GP_TONEMAP]->u.bd.value = pr.tonemap;
-    params[GP_TONEMAP]->uu.change_flags |= PF_ChangeFlag_CHANGED_VALUE;
+    set_check(GP_TONEMAP, pr.tonemap);
     return PF_Err_NONE;
+}
+
+// Greys out the controls of every group that is switched off, so the panel
+// shows at a glance what is active.
+PF_Err UpdateParamsUI(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[]) {
+    PF_Err err = PF_Err_NONE;
+    AEFX_SuiteScoper<PF_ParamUtilsSuite3> utils(in_data, kPFParamUtilsSuite, kPFParamUtilsSuiteVersion3, out_data);
+    auto enable = [&](int index, bool on) {
+        const bool disabled = (params[index]->ui_flags & PF_PUI_DISABLED) != 0;
+        if (disabled != on) return;  // already right
+        PF_ParamDef copy = *params[index];
+        if (on) {
+            copy.ui_flags &= ~PF_PUI_DISABLED;
+        } else {
+            copy.ui_flags |= PF_PUI_DISABLED;
+        }
+        ERR(utils->PF_UpdateParamUI(in_data->effect_ref, index, &copy));
+    };
+    const A_long tint = params[GP_TINT_MODE]->u.pd.value;
+    enable(GP_TINT_CORE, tint != TINT_NONE);
+    enable(GP_TINT_MID, tint == TINT_THREE);
+    enable(GP_TINT_HALO, tint != TINT_NONE);
+    const bool chroma = params[GP_CHROMA_ENABLE]->u.bd.value != 0;
+    for (int i : {GP_RADIUS_R, GP_RADIUS_G, GP_RADIUS_B}) enable(i, chroma);
+    enable(GP_ASPECT, params[GP_ANAMORPHIC_ENABLE]->u.bd.value != 0);
+    const bool dirt = params[GP_DIRT_ENABLE]->u.bd.value != 0;
+    for (int i : {GP_DIRT_LAYER, GP_DIRT_AMOUNT}) enable(i, dirt);
+    const bool depth = params[GP_DEPTH_ENABLE]->u.bd.value != 0;
+    for (int i : {GP_DEPTH_LAYER, GP_DEPTH_SPREAD, GP_OCCLUSION, GP_DEPTH_INVERT}) enable(i, depth);
+    enable(GP_TEMPORAL, params[GP_FLICKER_ENABLE]->u.bd.value != 0);
+    return err;
 }
 
 PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* extra) {
@@ -793,6 +883,7 @@ extern "C" DllExport PF_Err EffectMain(PF_Cmd cmd, PF_InData* in_data, PF_OutDat
             case PF_Cmd_PARAMS_SETUP: return ParamsSetup(in_data, out_data);
             case PF_Cmd_USER_CHANGED_PARAM:
                 return UserChangedParam(params, static_cast<const PF_UserChangedParamExtra*>(extra));
+            case PF_Cmd_UPDATE_PARAMS_UI: return UpdateParamsUI(in_data, out_data, params);
             case PF_Cmd_SMART_PRE_RENDER:
                 return PreRender(in_data, out_data, static_cast<PF_PreRenderExtra*>(extra));
             case PF_Cmd_SMART_RENDER:

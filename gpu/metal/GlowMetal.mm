@@ -122,18 +122,15 @@ Plan make_plan(int W, int H, const GlowParams& p) {
     if (base.w == 0 || base.h == 0) return plan;
 
     const float scale = float(H) / float(base.h);
-    const int n = level_count(p);
-    std::vector<float> weights(static_cast<size_t>(n));
-    float wsum = 0.0f;
-    for (int k = 0; k < n; ++k) {
-        weights[k] = std::pow(std::pow(2.0f, float(k)), 2.0f - p.spread);
-        wsum += weights[k];
-    }
+    // The core's level plan (per-level sigma, unnormalized weights), so the
+    // GPU follows any change to it.
+    const LevelPlan lp = level_plan(p);
+    const int n = int(lp.sigmas.size());
+    std::vector<float> weights = lp.weights;
     const float exposure_gain = std::pow(2.0f, p.exposure);
-    for (float& w : weights) w *= exposure_gain / wsum;
+    for (float& w : weights) w *= exposure_gain;
 
     const float ax = std::sqrt(p.aspect), ay = 1.0f / std::sqrt(p.aspect);
-    const float sigma_level = p.base_sigma / scale;
     int w = int(base.w), h = int(base.h);
     for (int k = 0; k < n; ++k) {
         if (k > 0) {
@@ -147,6 +144,8 @@ Plan make_plan(int W, int H, const GlowParams& p) {
         // Shrunk by the variance the upsample chain adds back (see glow_layer).
         const float extra_var = kTentStepVariance * (4.0f / 3.0f) * (1.0f - std::pow(4.0f, -float(k)));
         const Rgb tint = tint_for_level(p.tint, k, n);
+        // Sigma in this level's own pixels.
+        const float sigma_level = lp.sigmas[size_t(k)] / (std::pow(2.0f, float(k)) * scale);
         for (int c = 0; c < 3; ++c) {
             const float s = sigma_level * p.rgb_radius[c];
             const float sx = std::sqrt(std::max((s * ax) * (s * ax) - extra_var, 0.0f));

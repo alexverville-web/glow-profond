@@ -36,32 +36,37 @@ Profond**.
 
 ## Paramètres
 
+Interface en anglais (seul le nom « Glow Profond » reste en français). Les
+réglages essentiels sont en haut ; chaque option avancée est dans son groupe,
+fermé par défaut, derrière une case « Enable » (ses réglages sont grisés et
+ignorés tant que la case est décochée).
+
 | Paramètre AE | Champ `GlowParams` |
 | --- | --- |
-| Preset | aucun : remplit les réglages ci-dessous (Néon, Soleil doux, Ciné, Anamorphique, Texte lumineux, Bloom subtil). Laisse intacts l'affichage, la qualité, la saleté, l'anti-scintillement, l'unmult et le gamma |
-| Rayon | `radius` (σ du niveau le plus large, en px) |
-| Exposition | `exposure` (stops) |
-| Diffusion (falloff) | `spread` (2 = 1/r²) |
+| Preset | aucun : remplit les réglages (Neon, Soft Sun, Cinematic, Anamorphic, Glowing Text, Subtle Bloom). Laisse intacts View, Quality, Lens Dirt, Depth, Anti-Flicker, Unmultiply et Linear Light |
+| Radius (défaut 160) | `radius` (σ du niveau le plus large, en px, continu) |
+| Exposure (défaut −1,25) | `exposure` (stops) |
+| Threshold | `threshold` |
+| Spread (%, défaut 57,5) | `spread = 3 − 2 × Spread/100` : 100 % = 1/r (le plus large), 50 % = 1/r², 0 % = 1/r³ |
 | Saturation | `saturation` (%, 100 = inchangé, 0 = gris) |
-| Mode de fusion | `blend` : Ajout ou Écran (le glow ne fait pas sauter les blancs) |
-| Entrée › Seuil, Douceur du seuil | `threshold`, `threshold_smooth` |
-| Entrée › Unmult | `unmult` |
-| Entrée › Anti-scintillement | `temporal_smooth` (%) : mélange les images voisines (t ± 1 image) dans la source du glow |
-| Forme › Ratio d'aspect | `aspect` |
-| Forme › Rayon rouge / vert / bleu | `rgb_radius` |
-| Teinte › Mode, couleurs cœur / milieu / halo | `tint` (1, 2 ou 3 couleurs) |
-| Saleté de lentille › Texture, Intensité saleté | `GlowInputs::dirt` (calque étiré sur le calque de l'effet), `dirt_amount` (%) |
-| Profondeur › Calque de profondeur | `GlowInputs::depth` (canal rouge, 0 = proche, 1 = loin ; étiré sur le calque ; zones transparentes = loin). Sans calque, tout le groupe est ignoré |
-| Profondeur › Étalement selon la profondeur | `depth_spread` (0 à 1 : les sources lointaines diffusent plus large) |
-| Profondeur › Occlusion | `occlusion` (les pixels plus proches masquent le glow des sources plus lointaines) |
-| Profondeur › Inverser la profondeur | option du wrapper : `1 − rouge`, pour les passes Z où le blanc est proche |
-| Rendu › Correction gamma | `gamma_correct` (à couper dans un projet linéaire 32 bpc) |
-| Rendu › Tonemap ACES | `tonemap` |
-| Rendu › Sigma de base, Qualité | `base_sigma`, `downsample` (Maximale 1x … Brouillon 8x) |
-| Affichage | `view` : Résultat final, Glow seul, Source, Glow derrière (le glow passe sous le calque) |
+| Blend Mode | `blend` : Add ou Screen |
+| View | `view` : Final, Glow Only, Source, Glow Behind |
+| Color Tint › Tint, Core / Middle / Halo Color | `tint` (Off, 2 ou 3 couleurs) |
+| Chromatic Aberration › Enable, Red / Green / Blue Radius | `rgb_radius` (1, 1, 1 si décoché) |
+| Anamorphic › Enable, Aspect Ratio | `aspect` (1 si décoché) |
+| Lens Dirt › Enable, Dirt Texture, Dirt Amount | `GlowInputs::dirt` (calque étiré sur le calque de l'effet), `dirt_amount` (%) |
+| Depth › Enable, Depth Layer, Depth Spread, Occlusion, Invert Depth | `GlowInputs::depth` (rouge, 0 = proche ; zones transparentes = loin), `depth_spread`, `occlusion` ; Invert = `1 − rouge`. Ignoré sans calque |
+| Anti-Flicker › Enable, Smoothing | `temporal_smooth` (%) : mélange les images t ± 1 dans la source du glow |
+| Advanced › Threshold Smoothness, Unmultiply, Linear Light, ACES Tonemap, Core Size, Quality | `threshold_smooth`, `unmult`, `gamma_correct`, `tonemap`, `base_sigma`, `downsample` |
 
-Les nouveaux paramètres ont des identifiants disque ajoutés en fin de liste :
-les projets enregistrés avec les versions précédentes s'ouvrent toujours.
+Les valeurs par défaut reproduisent le glow par défaut de Deep Glow autour
+d'une forme blanche (comparaison de rendus, voir
+`build-mac/test/defaults_vs_deepglow.png` sur la machine de build).
+
+Les identifiants disque ne sont jamais renumérotés : les nouveaux paramètres
+sont ajoutés en fin de liste. L'ancien « Diffusion (falloff) » (exposant brut)
+est remplacé par Spread (%) : les projets des versions précédentes s'ouvrent,
+mais reprennent le Spread par défaut.
 
 Les tailles en pixels (rayon, sigma de base) suivent la résolution de
 l'aperçu : un aperçu en demi-résolution garde le même look.
