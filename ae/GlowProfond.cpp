@@ -221,7 +221,7 @@ A_long GlowPadding(const GlowParams& p) {
 template <class Pixel>
 void ReadPixels(const PF_EffectWorld* world, float max_value, Image& img, int dx, int dy) {
     for (A_long y = 0; y < world->height; ++y) {
-        const Pixel* row = reinterpret_cast<const Pixel*>(static_cast<const char*>(world->data) + y * world->rowbytes);
+        const Pixel* row = reinterpret_cast<const Pixel*>(reinterpret_cast<const char*>(world->data) + y * world->rowbytes);
         for (A_long x = 0; x < world->width; ++x) {
             float* o = img.px(int(x) + dx, int(y) + dy);
             o[0] = float(row[x].red) / max_value;
@@ -239,7 +239,7 @@ void WritePixels(const Image& img, int dx, int dy, float max_value, bool clamp, 
         return static_cast<Channel>(v * max_value);
     };
     for (A_long y = 0; y < world->height; ++y) {
-        Pixel* row = reinterpret_cast<Pixel*>(static_cast<char*>(world->data) + y * world->rowbytes);
+        Pixel* row = reinterpret_cast<Pixel*>(reinterpret_cast<char*>(world->data) + y * world->rowbytes);
         for (A_long x = 0; x < world->width; ++x) {
             const float* s = img.px(int(x) + dx, int(y) + dy);
             row[x].red = conv(s[0]);
@@ -433,8 +433,11 @@ PF_Err SmartRender(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra
 extern "C" DllExport PF_Err PluginDataEntryFunction2(PF_PluginDataPtr inPtr, PF_PluginDataCB2 inPluginDataCallBackPtr,
                                                       SPBasicSuite* inSPBasicSuitePtr, const char* inHostName,
                                                       const char* inHostVersion) {
-    return PF_REGISTER_EFFECT_EXT2(inPtr, inPluginDataCallBackPtr, GP_NAME, GP_MATCH_NAME, GP_CATEGORY,
-                                   AE_RESERVED_INFO, "EffectMain", GP_SUPPORT_URL);
+    // The SDK macro assigns to a local named `result`.
+    PF_Err result = PF_Err_INVALID_CALLBACK;
+    result = PF_REGISTER_EFFECT_EXT2(inPtr, inPluginDataCallBackPtr, GP_NAME, GP_MATCH_NAME, GP_CATEGORY,
+                                     AE_RESERVED_INFO, "EffectMain", GP_SUPPORT_URL);
+    return result;
 }
 
 extern "C" DllExport PF_Err EffectMain(PF_Cmd cmd, PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[],

@@ -2,12 +2,22 @@
 
 ## Prérequis
 
-- macOS 11+ avec Xcode (pour `clang` et `Rez`) et CMake 3.20+.
+- macOS 11+ avec les Command Line Tools d'Apple (`clang`, `Rez`). CMake 3.20+ et Xcode sont facultatifs.
 - Le SDK After Effects 2022 ou plus récent, téléchargé depuis
   [developer.adobe.com](https://developer.adobe.com/after-effects/) (compte
   Adobe requis, le SDK ne peut pas être versionné dans ce dépôt).
 
 ## Compilation
+
+Sans Xcode ni CMake (Command Line Tools seulement) :
+
+```sh
+AE_SDK_ROOT=~/Documents/AE_Development/AfterEffectsSDK ae/build_mac.sh
+```
+
+Le plug-in est produit dans `build-mac/GlowProfond.plugin`.
+
+Avec CMake (et Xcode, ou `-G "Unix Makefiles"` sans Xcode) :
 
 ```sh
 cmake -S . -B build-ae -G Xcode -DAE_SDK_ROOT="$HOME/SDK/AfterEffectsSDK"
