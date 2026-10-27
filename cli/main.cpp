@@ -120,6 +120,13 @@ int usage() {
                  "  --base-sigma F        tightest level sigma (1.5)\n"
                  "  --downsample N        extra global downsample, power of two (1)\n"
                  "  --view final|glow|source\n"
+                 "  --blend add|screen    how the glow is laid over the source (add)\n"
+                 "  --dirt FILE           lens dirt texture, same encoding as IN\n"
+                 "  --dirt-amount F       lens dirt strength (0)\n"
+                 "  --depth FILE          depth map, first channel, 0 = near, 1 = far\n"
+                 "  --depth-spread F      far sources glow wider, 0..1 (0)\n"
+                 "  --occlusion           nearer pixels mask the glow of farther ones\n"
+                 "  --occlusion-softness F  depth range of the occlusion edge (0.05)\n"
                  "  --unmult  --tonemap  --linear (disable gamma correction)\n"
                  "  --bench N             time N renders and print the average\n";
     return 2;
@@ -133,6 +140,7 @@ int main(int argc, char** argv) {
     GlowParams p;
     bool tint_set = false;
     int bench = 0;
+    std::string dirt_path, depth_path;
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
         const bool has_value = i + 1 < argc;
@@ -155,7 +163,15 @@ int main(int argc, char** argv) {
             p.view = v == "glow" ? glow_profond::View::Glow
                    : v == "source" ? glow_profond::View::Source
                                    : glow_profond::View::Final;
-        } else if (a == "--bench" && has_value) bench = std::atoi(next());
+        } else if (a == "--blend" && has_value) {
+            p.blend = std::string(next()) == "screen" ? glow_profond::Blend::Screen : glow_profond::Blend::Add;
+        } else if (a == "--dirt" && has_value) dirt_path = next();
+        else if (a == "--dirt-amount" && has_value) p.dirt_amount = std::strtof(next(), nullptr);
+        else if (a == "--depth" && has_value) depth_path = next();
+        else if (a == "--depth-spread" && has_value) p.depth_spread = std::strtof(next(), nullptr);
+        else if (a == "--occlusion") p.occlusion = true;
+        else if (a == "--occlusion-softness" && has_value) p.occlusion_softness = std::strtof(next(), nullptr);
+        else if (a == "--bench" && has_value) bench = std::atoi(next());
         else if (a == "--unmult") p.unmult = true;
         else if (a == "--tonemap") p.tonemap = true;
         else if (a == "--linear") p.gamma_correct = false;
@@ -167,13 +183,22 @@ int main(int argc, char** argv) {
         std::cerr << "cannot read " << in << "\n";
         return 1;
     }
+    Image dirt, depth;
+    for (auto [path, img] : {std::pair{&dirt_path, &dirt}, std::pair{&depth_path, &depth}}) {
+        if (!path->empty() && !read_image(*path, *img)) {
+            std::cerr << "cannot read " << *path << "\n";
+            return 1;
+        }
+    }
+    const Image* depth_in = depth_path.empty() ? nullptr : &depth;
+    const Image* dirt_in = dirt_path.empty() ? nullptr : &dirt;
     for (int i = 0; i < bench; ++i) {
         const auto t0 = std::chrono::steady_clock::now();
-        glow_profond::render(src, p);
+        glow_profond::render(src, p, depth_in, dirt_in);
         const std::chrono::duration<double, std::milli> dt = std::chrono::steady_clock::now() - t0;
         std::cout << "render " << src.width << "x" << src.height << ": " << dt.count() << " ms\n";
     }
-    const Image result = glow_profond::render(src, p);
+    const Image result = glow_profond::render(src, p, depth_in, dirt_in);
     if (!write_image(out, result)) {
         std::cerr << "cannot write " << out << "\n";
         return 1;

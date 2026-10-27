@@ -17,8 +17,8 @@ using Rgb = std::array<float, 3>;
 
 enum class View { Final, Glow, Source };
 
-// How the glow is laid over the source. Screen never pushes a channel that
-// is at or below 1 past 1, so whites don't blow out.
+// How the glow is laid over the source: add, or screen (src + glow * (1 - src)
+// on channels at or below 1, so whites blow out much less).
 enum class Blend { Add, Screen };
 
 struct GlowParams {
@@ -38,6 +38,9 @@ struct GlowParams {
     View view = View::Final;
     Blend blend = Blend::Add;
     float dirt_amount = 0.0f;        // lens dirt lit by the wide part of the glow
+    float depth_spread = 0.0f;       // 0..1: far sources (depth 1) push energy to wide levels
+    bool occlusion = false;          // nearer pixels mask the glow of farther sources
+    float occlusion_softness = 0.05f;  // depth range of the occlusion smoothstep
     float temporal_smooth = 0.0f;    // 0..1, blends neighbouring frames into the glow source
 };
 
@@ -59,24 +62,30 @@ struct Image {
 int level_count(const GlowParams& p);
 
 // Glow only, linear light, same size as src (3 channels, premultiplied).
-// dirt, when given, is a linear RGB texture of the same size, lit by the wide
-// half of the pyramid and scaled by p.dirt_amount.
-Image glow_layer(const Image& src_lin_rgb, const GlowParams& p, const Image* dirt = nullptr);
+// depth, when given, is read from its first channel (0 = near, 1 = far) and
+// drives p.depth_spread and p.occlusion. dirt, when given, is a linear RGB
+// texture lit by the untinted wide half of the pyramid, scaled by
+// p.dirt_amount. Both are resized bilinearly if their size differs.
+Image glow_layer(const Image& src_lin_rgb, const GlowParams& p, const Image* depth = nullptr,
+                 const Image* dirt = nullptr);
 
 // Full effect. src has 3 or 4 channels; returns 3 channels, like the
-// reference render().
-Image render(const Image& src, const GlowParams& p);
+// reference render(). dirt is in the same encoding as src.
+Image render(const Image& src, const GlowParams& p, const Image* depth = nullptr, const Image* dirt = nullptr);
 
 // Host-facing variant for After Effects: src is RGBA premultiplied, and so
 // is the result. The glow widens the alpha coverage so it shows past the
 // layer's edges. For opaque input its RGB equals render().
 //
 // Optional host inputs, all the same size as src and in the same encoding:
+// - depth: depth map, red channel, 0 = near, 1 = far (not linearized; RGBA
+//   input is unpremultiplied first);
 // - dirt: lens dirt texture (RGBA, straight or premultiplied alike);
 // - neighbors: the previous/next frames (RGBA premultiplied), averaged into
 //   the glow source by p.temporal_smooth to calm flickering highlights. The
 //   source itself is still composited from the current frame only.
 struct GlowInputs {
+    const Image* depth = nullptr;
     const Image* dirt = nullptr;
     std::vector<const Image*> neighbors;
 };

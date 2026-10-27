@@ -35,7 +35,29 @@ CASES = [
     ("linear_downsample", GlowParams(radius=120, gamma_correct=False, downsample=2),
      ["--radius", "120", "--linear", "--downsample", "2"]),
     ("unmult", GlowParams(radius=80, unmult=True), ["--radius", "80", "--unmult"]),
+    ("screen", GlowParams(radius=200, blend="screen", exposure=1),
+     ["--radius", "200", "--blend", "screen", "--exposure", "1"]),
+    ("dirt", GlowParams(radius=200, dirt_amount=2.0, tint=((1, 0.5, 0.2),), exposure=1),
+     ["--radius", "200", "--dirt-amount", "2", "--tint", "1,0.5,0.2", "--exposure", "1", "--dirt", "@dirt"]),
+    ("depth_spread", GlowParams(radius=200, depth_spread=0.8),
+     ["--radius", "200", "--depth-spread", "0.8", "--depth", "@depth"]),
+    ("occlusion", GlowParams(radius=200, occlusion=True, exposure=1),
+     ["--radius", "200", "--occlusion", "--exposure", "1", "--depth", "@depth"]),
+    ("depth_all_downsample", GlowParams(radius=150, depth_spread=0.5, occlusion=True, occlusion_softness=0.2,
+                                        downsample=2, dirt_amount=1.0),
+     ["--radius", "150", "--depth-spread", "0.5", "--occlusion", "--occlusion-softness", "0.2",
+      "--downsample", "2", "--dirt-amount", "1", "--depth", "@depth", "--dirt", "@dirt"]),
 ]
+
+
+def aux_maps(shape):
+    """Depth (left near, right far, with a near disc) and a blotchy dirt texture."""
+    h, w = shape
+    y, x = np.mgrid[0:h, 0:w].astype(np.float32)
+    depth = x / (w - 1)
+    depth = np.where((x - 0.6 * w) ** 2 + (y - 0.5 * h) ** 2 < (0.12 * h) ** 2, 0.1, depth)
+    dirt = 0.5 + 0.5 * np.sin(x / 7.0)[..., None] * np.cos(y / 11.0)[..., None] * np.array([1, 0.8, 0.6])
+    return depth.astype(np.float32), dirt.astype(np.float32)
 
 
 def write_pfm(path, img):
@@ -61,11 +83,17 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         src_path = Path(tmp) / "scene.pfm"
         write_pfm(src_path, src)
+        depth, dirt = aux_maps(src.shape[:2])
+        aux = {"@depth": Path(tmp) / "aux_depth.pfm", "@dirt": Path(tmp) / "aux_dirt.pfm"}
+        write_pfm(aux["@depth"], np.repeat(depth[..., None], 3, axis=-1))
+        write_pfm(aux["@dirt"], dirt)
         for name, params, flags in CASES:
-            out_path = Path(tmp) / f"{name}.pfm"
-            subprocess.run([cli, str(src_path), str(out_path), *flags], check=True)
+            out_path = Path(tmp) / f"out_{name}.pfm"
+            args = [str(aux.get(f, f)) for f in flags]
+            subprocess.run([cli, str(src_path), str(out_path), *args], check=True)
             ours = read_pfm(out_path)
-            ref = render(src, params)
+            ref = render(src, params, depth=depth if "@depth" in flags else None,
+                         dirt=dirt if "@dirt" in flags else None)
             err = float(np.abs(ours - ref).max())
             ok = err <= TOLERANCE
             failures += not ok

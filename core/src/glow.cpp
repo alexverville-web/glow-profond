@@ -204,25 +204,25 @@ void blur_axis(Image& img, int channel, float sigma, bool vertical) {
 
 namespace {
 
-// Separable Gaussian on the three channels of a level, both axes, with one
+// Separable Gaussian on every channel of a level, both axes, with one
 // scratch copy per axis. Same arithmetic as blur_axis (zero padding, same
 // summation order), so results match it bit for bit.
-void blur_level(Image& img, const float (&sx)[3], const float (&sy)[3]) {
+void blur_level(Image& img, const std::vector<float>& sx, const std::vector<float>& sy) {
     const int W = img.width, H = img.height, ch = img.channels;
-    std::vector<float> kx[3], ky[3];
+    std::vector<std::vector<float>> kx(static_cast<size_t>(ch)), ky(static_cast<size_t>(ch));
     bool any_x = false, any_y = false;
-    for (int c = 0; c < 3; ++c) {
+    for (int c = 0; c < ch; ++c) {
         if (sx[c] >= 0.3f) { kx[c] = gauss_kernel(sx[c]); any_x = true; }
         if (sy[c] >= 0.3f) { ky[c] = gauss_kernel(sy[c]); any_y = true; }
     }
     // Without chromatic aberration all channels share one kernel: then each
     // tap is a multiply-add over a whole contiguous row, which vectorizes.
-    const bool same_x = ch == 3 && sx[0] == sx[1] && sx[1] == sx[2];
-    const bool same_y = ch == 3 && sy[0] == sy[1] && sy[1] == sy[2];
+    const bool same_x = std::all_of(sx.begin(), sx.end(), [&](float s) { return s == sx[0]; });
+    const bool same_y = std::all_of(sy.begin(), sy.end(), [&](float s) { return s == sy[0]; });
     const size_t stride = size_t(W) * ch;
     if (any_x) {
         int rmax = 0;
-        for (int c = 0; c < 3; ++c) rmax = std::max(rmax, int(kx[c].size()) / 2);
+        for (int c = 0; c < ch; ++c) rmax = std::max(rmax, int(kx[c].size()) / 2);
         const std::vector<float> src(img.data);
         parallel_rows(H, [&](int y) {
             // Zero-padded copy of the row: taps never need bounds checks, and
@@ -240,7 +240,7 @@ void blur_level(Image& img, const float (&sx)[3], const float (&sy)[3]) {
                 }
                 return;
             }
-            for (int c = 0; c < 3; ++c) {
+            for (int c = 0; c < ch; ++c) {
                 if (kx[c].empty()) continue;
                 const int r = int(kx[c].size()) / 2;
                 for (int x = 0; x < W; ++x) out[size_t(x) * ch + c] = 0.0f;
@@ -269,7 +269,7 @@ void blur_level(Image& img, const float (&sx)[3], const float (&sy)[3]) {
                 }
                 return;
             }
-            for (int c = 0; c < 3; ++c) {
+            for (int c = 0; c < ch; ++c) {
                 if (ky[c].empty()) continue;
                 const float* k = ky[c].data();
                 const int r = int(ky[c].size()) / 2;
@@ -283,39 +283,6 @@ void blur_level(Image& img, const float (&sx)[3], const float (&sy)[3]) {
             }
         });
     }
-}
-
-// acc += gain * upsample_to(img, acc size), without materializing the
-// upsampled image. Same interpolation arithmetic as upsample_to.
-void accumulate_upsampled(Image& acc, const Image& img, const Rgb& gain) {
-    const int width = acc.width, height = acc.height;
-    const int w = img.width, h = img.height;
-    std::vector<int> x0(static_cast<size_t>(width)), x1(static_cast<size_t>(width));
-    std::vector<float> fx(static_cast<size_t>(width));
-    for (int x = 0; x < width; ++x) {
-        const float xs = std::clamp((float(x) + 0.5f) * float(w) / float(width) - 0.5f, 0.0f, float(w - 1));
-        x0[x] = int(std::floor(xs));
-        x1[x] = std::min(x0[x] + 1, w - 1);
-        fx[x] = xs - float(x0[x]);
-    }
-    parallel_rows(height, [&](int y) {
-        const float ys = std::clamp((float(y) + 0.5f) * float(h) / float(height) - 0.5f, 0.0f, float(h - 1));
-        const int y0 = int(std::floor(ys));
-        const int y1 = std::min(y0 + 1, h - 1);
-        const float fy = ys - float(y0);
-        for (int x = 0; x < width; ++x) {
-            const float* p00 = img.px(x0[x], y0);
-            const float* p01 = img.px(x1[x], y0);
-            const float* p10 = img.px(x0[x], y1);
-            const float* p11 = img.px(x1[x], y1);
-            float* a = acc.px(x, y);
-            for (int c = 0; c < 3; ++c) {
-                const float top = p00[c] * (1.0f - fx[x]) + p01[c] * fx[x];
-                const float bot = p10[c] * (1.0f - fx[x]) + p11[c] * fx[x];
-                a[c] += gain[c] * (top * (1.0f - fy) + bot * fy);
-            }
-        }
-    });
 }
 
 }  // namespace
@@ -413,15 +380,36 @@ int level_count(const GlowParams& p) {
     return std::max(1, int(std::floor(std::log2(ratio))) + 1);
 }
 
-Image glow_layer(const Image& src, const GlowParams& p, const Image* dirt) {
+namespace {
+
+float smoothstep(float e0, float e1, float x) {
+    const float t = std::clamp((x - e0) / std::max(e1 - e0, 1e-6f), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+// First channel of img as a 1-channel map of size W x H (bilinear if needed).
+Image depth_map(const Image& img, int W, int H) {
+    Image d(img.width, img.height, 1);
+    for (size_t i = 0; i < d.data.size(); ++i) d.data[i] = img.data[i * size_t(img.channels)];
+    return (d.width == W && d.height == H) ? d : upsample_to(d, W, H);
+}
+
+}  // namespace
+
+Image glow_layer(const Image& src, const GlowParams& p, const Image* depth, const Image* dirt) {
     const int H = src.height, W = src.width;
-    Image img = soft_threshold(src, p.threshold, p.threshold_smooth);
+    Image thr = soft_threshold(src, p.threshold, p.threshold_smooth);
+    Image d;
+    if (depth) d = depth_map(*depth, W, H);
     const int extra = int(std::log2(float(std::max(p.downsample, 1))));
-    for (int i = 0; i < extra; ++i) img = downsample2(img);
+    for (int i = 0; i < extra; ++i) {
+        thr = downsample2(thr);
+        if (depth) d = downsample2(d);
+    }
 
-    if (img.width == 0 || img.height == 0) return Image(W, H, 3);
+    if (thr.width == 0 || thr.height == 0) return Image(W, H, 3);
 
-    const float scale = float(H) / float(img.height);
+    const float scale = float(H) / float(thr.height);
     const int n = level_count(p);
     std::vector<float> weights(static_cast<size_t>(n));
     float wsum = 0.0f;
@@ -429,83 +417,170 @@ Image glow_layer(const Image& src, const GlowParams& p, const Image* dirt) {
         weights[k] = std::pow(std::pow(2.0f, float(k)), 2.0f - p.spread);
         wsum += weights[k];
     }
-    // Exposure is folded into the level weights: one less full-size pass.
-    const float exposure_gain = std::pow(2.0f, p.exposure);
-    for (float& w : weights) w *= exposure_gain / wsum;
+    for (float& w : weights) w /= wsum;
 
     const float ax = std::sqrt(p.aspect), ay = 1.0f / std::sqrt(p.aspect);
     const float sigma_level = p.base_sigma / scale;  // same in every level's own pixels
-    std::vector<Image> levels;
-    levels.push_back(std::move(img));
-    for (int k = 1; k < n; ++k) {
-        Image next = downsample2(levels.back());
-        if (next.width == 0 || next.height == 0) break;  // tiny images: fewer levels
-        levels.push_back(std::move(next));
-    }
-    const int used = int(levels.size());
+    const bool occlude = p.occlusion && depth;
+    const float spread = depth ? std::clamp(p.depth_spread, 0.0f, 1.0f) : 0.0f;
+    const bool want_dirt = dirt && p.dirt_amount > 0.0f;
+    const int large_from = n / 2;  // levels feeding the lens dirt
 
-    // Blur level k in place and scale it by its weight and tint. The blur is
+    // Depth spread: a source at depth d sends w_k * lerp(1, 2^(k - n/2), spread * d)
+    // to level k, renormalized so its total is 1. That factor is affine in d
+    // once divided by Z(d), so two pyramids (a, b) replace one per level:
+    // level input k = down^k(a) + c_k * down^k(b), c_k = 2^(k - n/2) - 1.
+    std::vector<float> c(static_cast<size_t>(n));
+    float wc = 0.0f;
+    for (int k = 0; k < n; ++k) {
+        c[k] = std::pow(2.0f, float(k) - float(n) / 2.0f) - 1.0f;
+        wc += weights[k] * c[k];
+    }
+    // Channels 3-4 carry intensity and intensity * depth for occlusion.
+    const int pc = occlude ? 5 : 3;
+    auto extend = [&](Image& out, int x, int y, const float* rgb) {
+        float* o = out.px(x, y);
+        for (int ch = 0; ch < 3; ++ch) o[ch] = rgb[ch];
+        if (occlude) {
+            const float i = (rgb[0] + rgb[1] + rgb[2]) / 3.0f;
+            o[3] = i;
+            o[4] = i * d.px(x, y)[0];
+        }
+    };
+    std::vector<Image> pyr_a, pyr_b;
+    if (pc == 3 && spread == 0.0f) {
+        pyr_a.push_back(std::move(thr));  // plain glow: the thresholded image is level 0
+    } else {
+        Image a(thr.width, thr.height, pc), b;
+        if (spread > 0.0f) b = Image(thr.width, thr.height, pc);
+        parallel_rows(thr.height, [&](int y) {
+            for (int x = 0; x < thr.width; ++x) {
+                const float* t = thr.px(x, y);
+                if (spread > 0.0f) {
+                    const float sd = spread * d.px(x, y)[0];
+                    const float z = 1.0f + sd * wc;
+                    const float va[3] = {t[0] / z, t[1] / z, t[2] / z};
+                    const float vb[3] = {t[0] * sd / z, t[1] * sd / z, t[2] * sd / z};
+                    extend(a, x, y, va);
+                    extend(b, x, y, vb);
+                } else {
+                    extend(a, x, y, t);
+                }
+            }
+        });
+        pyr_a.push_back(std::move(a));
+        if (spread > 0.0f) pyr_b.push_back(std::move(b));
+    }
+    for (int k = 1; k < n; ++k) {
+        Image next = downsample2(pyr_a.back());
+        if (next.width == 0 || next.height == 0) break;  // tiny images: fewer levels
+        pyr_a.push_back(std::move(next));
+        if (!pyr_b.empty()) pyr_b.push_back(downsample2(pyr_b.back()));
+    }
+    const int used = int(pyr_a.size());
+
+    // Folded channels: tinted glow (3), untinted wide glow for the dirt (3),
+    // occlusion sums (2). Only what the settings need is carried.
+    const int large_off = 3, occ_off = want_dirt ? 6 : 3;
+    const int ac = occ_off + (occlude ? 2 : 0);
+    // Exposure is folded into the level weights: one less full-size pass
+    // (the occlusion ratio is unaffected by a common gain).
+    const float exposure_gain = std::pow(2.0f, p.exposure);
+
+    // Level k blurred and weighted, with the ac folded channels. The blur is
     // shrunk by the variance its upsample chain adds back, so the effective
     // sigma stays base_sigma * 2^k.
-    auto blur_weighted = [&](int k) {
-        const float extra = kTentStepVariance * (4.0f / 3.0f) * (1.0f - std::pow(4.0f, -float(k)));
-        float sx[3], sy[3];
-        for (int c = 0; c < 3; ++c) {
-            const float s = sigma_level * p.rgb_radius[c];
-            sx[c] = std::sqrt(std::max((s * ax) * (s * ax) - extra, 0.0f));
-            sy[c] = std::sqrt(std::max((s * ay) * (s * ay) - extra, 0.0f));
+    auto contribution = [&](int k) {
+        Image lvl = std::move(pyr_a[size_t(k)]);
+        if (!pyr_b.empty()) {
+            const Image& b = pyr_b[size_t(k)];
+            for (size_t i = 0; i < lvl.data.size(); ++i) lvl.data[i] += c[k] * b.data[i];
         }
-        Image& lvl = levels[size_t(k)];
+        const float var = kTentStepVariance * (4.0f / 3.0f) * (1.0f - std::pow(4.0f, -float(k)));
+        std::vector<float> sx(static_cast<size_t>(pc)), sy(static_cast<size_t>(pc));
+        for (int ch = 0; ch < pc; ++ch) {
+            const float s = sigma_level * (ch < 3 ? p.rgb_radius[ch] : 1.0f);
+            sx[ch] = std::sqrt(std::max((s * ax) * (s * ax) - var, 0.0f));
+            sy[ch] = std::sqrt(std::max((s * ay) * (s * ay) - var, 0.0f));
+        }
         blur_level(lvl, sx, sy);
+        const float w = weights[k] * exposure_gain;
         const Rgb tint = tint_for_level(p.tint, k, n);
         Rgb gain;
-        for (int c = 0; c < 3; ++c) gain[c] = weights[k] * tint[c];
-        parallel_rows(lvl.height, [&](int y) {
-            for (int x = 0; x < lvl.width; ++x) {
-                float* v = lvl.px(x, y);
-                for (int c = 0; c < 3; ++c) v[c] = gain[c] * v[c];
+        for (int ch = 0; ch < 3; ++ch) gain[ch] = w * tint[ch];
+        const float large = k >= large_from ? w : 0.0f;
+        Image out = ac == pc ? std::move(lvl) : Image(lvl.width, lvl.height, ac);
+        const Image& in = ac == pc ? out : lvl;
+        if (ac == 3) {  // plain glow, in place
+            parallel_rows(out.height, [&](int y) {
+                float* v = out.px(0, y);
+                for (int x = 0; x < out.width; ++x, v += 3)
+                    for (int ch = 0; ch < 3; ++ch) v[ch] *= gain[ch];
+            });
+            return out;
+        }
+        parallel_rows(out.height, [&](int y) {
+            for (int x = 0; x < out.width; ++x) {
+                const float* v = in.px(x, y);
+                float* o = out.px(x, y);
+                const float rgb[3] = {v[0], v[1], v[2]};
+                const float occ[2] = {occlude ? v[3] : 0.0f, occlude ? v[4] : 0.0f};
+                for (int ch = 0; ch < 3; ++ch) o[ch] = gain[ch] * rgb[ch];
+                if (want_dirt)
+                    for (int ch = 0; ch < 3; ++ch) o[large_off + ch] = large * rgb[ch];
+                if (occlude) {
+                    o[occ_off] = w * occ[0];
+                    o[occ_off + 1] = w * occ[1];
+                }
             }
         });
+        return out;
     };
 
-    // Lens dirt is lit by the wide half of the pyramid: the cascade holds
-    // exactly that sum once it has folded down to level used / 2.
-    const bool want_dirt = dirt && p.dirt_amount > 0.0f;
-    const int dirt_level = used / 2;
-    Image wide;
-
-    blur_weighted(used - 1);
-    Image cascade = std::move(levels[size_t(used - 1)]);
-    if (want_dirt && dirt_level == used - 1) wide = cascade;
+    Image acc = contribution(used - 1);
     for (int k = used - 2; k >= 0; --k) {
-        blur_weighted(k);
-        const Image& lvl = levels[size_t(k)];
-        cascade = upsample_tent2_add(cascade, lvl.width, lvl.height, &lvl);
-        if (want_dirt && k == dirt_level) wide = cascade;
+        const Image lvl = contribution(k);
+        acc = upsample_tent2_add(acc, lvl.width, lvl.height, &lvl);
     }
-    Image acc;
-    if (cascade.width == W && cascade.height == H) {
-        acc = std::move(cascade);
-    } else {
-        acc = Image(W, H, 3);
-        accumulate_upsampled(acc, cascade, {1.0f, 1.0f, 1.0f});
-    }
+    if (acc.width != W || acc.height != H) acc = upsample_to(acc, W, H);
+    if (ac == 3) return acc;
+
+    Image d_full, dirt_full;
+    if (occlude) d_full = depth_map(*depth, W, H);
     if (want_dirt) {
-        Image lit(W, H, 3);
-        accumulate_upsampled(lit, wide, {p.dirt_amount, p.dirt_amount, p.dirt_amount});
-        parallel_rows(H, [&](int y) {
-            for (int x = 0; x < W; ++x) {
-                const float* d = dirt->px(x, y);
-                const float* l = lit.px(x, y);
-                float* a = acc.px(x, y);
-                for (int c = 0; c < 3; ++c) a[c] += d[c] * l[c];
-            }
-        });
+        dirt_full = (dirt->width == W && dirt->height == H) ? Image() : upsample_to(*dirt, W, H);
     }
-    return acc;
+    const Image* dirt_img = want_dirt ? (dirt_full.data.empty() ? dirt : &dirt_full) : nullptr;
+    Image glow(W, H, 3);
+    parallel_rows(H, [&](int y) {
+        for (int x = 0; x < W; ++x) {
+            const float* a = acc.px(x, y);
+            float* g = glow.px(x, y);
+            float keep = 1.0f;
+            if (occlude) {
+                const float d_mean = a[occ_off + 1] / std::max(a[occ_off], 1e-8f);
+                keep = 1.0f - smoothstep(0.0f, p.occlusion_softness, d_mean - d_full.px(x, y)[0]);
+            }
+            for (int ch = 0; ch < 3; ++ch) g[ch] = a[ch] * keep;
+            if (dirt_img) {
+                const float* dt = dirt_img->px(x, y);
+                for (int ch = 0; ch < 3; ++ch) g[ch] += p.dirt_amount * dt[ch] * a[large_off + ch];
+            }
+        }
+    });
+    return glow;
 }
 
-Image render(const Image& src, const GlowParams& p) {
+namespace {
+
+// Screen is a + b - ab on channels at or below 1.
+float composite(float base, float glow, Blend blend) {
+    return blend == Blend::Screen ? base + glow * (1.0f - std::clamp(base, 0.0f, 1.0f)) : base + glow;
+}
+
+}  // namespace
+
+Image render(const Image& src, const GlowParams& p, const Image* depth, const Image* dirt) {
     const int W = src.width, H = src.height;
     Image lin(W, H, 3);
     parallel_rows(H, [&](int y) {
@@ -524,16 +599,21 @@ Image render(const Image& src, const GlowParams& p) {
 
     Image out = lin;
     if (p.view != View::Source) {
-        const Image g = glow_layer(lin, p);
+        Image dirt_lin;
+        if (dirt && p.dirt_amount > 0.0f) {
+            dirt_lin = Image(dirt->width, dirt->height, 3);
+            for (int y = 0; y < dirt->height; ++y)
+                for (int x = 0; x < dirt->width; ++x)
+                    for (int c = 0; c < 3; ++c) {
+                        const float v = dirt->px(x, y)[c];
+                        dirt_lin.px(x, y)[c] = p.gamma_correct ? srgb_to_linear(v) : v;
+                    }
+        }
+        const Image g = glow_layer(lin, p, depth, dirt_lin.data.empty() ? nullptr : &dirt_lin);
         if (p.view == View::Glow) {
             out = g;
         } else {
-            for (size_t i = 0; i < out.data.size(); ++i) {
-                const float base = out.data[i];
-                out.data[i] += p.blend == Blend::Screen
-                                   ? std::min(g.data[i], 1.0f) * (1.0f - std::clamp(base, 0.0f, 1.0f))
-                                   : g.data[i];
-            }
+            for (size_t i = 0; i < out.data.size(); ++i) out.data[i] = composite(out.data[i], g.data[i], p.blend);
         }
     }
     parallel_rows(H, [&](int y) {
@@ -607,7 +687,20 @@ Image render_premultiplied(const Image& src, const GlowParams& p, const GlowInpu
         }
         Image dirt_lin;
         if (inputs.dirt && p.dirt_amount > 0.0f) dirt_lin = linearize(*inputs.dirt, false);
-        glow = glow_layer(*glow_src, p, dirt_lin.data.empty() ? nullptr : &dirt_lin);
+        // Depth is data, not colour: read straight, never linearized.
+        Image depth;
+        if (inputs.depth) {
+            const Image& d = *inputs.depth;
+            depth = Image(d.width, d.height, 1);
+            for (int y = 0; y < d.height; ++y)
+                for (int x = 0; x < d.width; ++x) {
+                    const float* s = d.px(x, y);
+                    const float a = d.channels == 4 ? s[3] : 1.0f;
+                    depth.px(x, y)[0] = d.channels == 4 ? (a > 0.0f ? s[0] / a : 1.0f) : s[0];
+                }
+        }
+        glow = glow_layer(*glow_src, p, inputs.depth ? &depth : nullptr,
+                          dirt_lin.data.empty() ? nullptr : &dirt_lin);
     }
 
     Image out(W, H, 4);
@@ -624,11 +717,7 @@ Image render_premultiplied(const Image& src, const GlowParams& p, const GlowInpu
                     for (int c = 0; c < 3; ++c) premult[c] = g[c];
                     a = coverage;
                 } else {
-                    for (int c = 0; c < 3; ++c) {
-                        const float screen = 1.0f - std::clamp(premult[c], 0.0f, 1.0f);
-                        // Screen is a + b - ab with the glow capped at 1, so it never blows out.
-                        premult[c] += p.blend == Blend::Screen ? std::min(g[c], 1.0f) * screen : g[c];
-                    }
+                    for (int c = 0; c < 3; ++c) premult[c] = composite(premult[c], g[c], p.blend);
                     a = a + (1.0f - a) * coverage;  // glow extends the layer's coverage
                 }
             }

@@ -152,7 +152,7 @@ static Image dot_scene(float v) {
     return img;
 }
 
-static void test_screen_never_exceeds_one() {
+static void test_screen_composite() {
     Image src(64, 64, 4);
     for (int y = 0; y < 64; ++y)
         for (int x = 0; x < 64; ++x) {
@@ -162,14 +162,54 @@ static void test_screen_never_exceeds_one() {
         }
     GlowParams p;
     p.radius = 20.0f;
-    p.exposure = 3.0f;
     p.blend = Blend::Screen;
     p.gamma_correct = false;
+    p.view = View::Glow;
+    const Image g = render_premultiplied(src, p);
+    p.view = View::Final;
     const Image out = render_premultiplied(src, p);
-    for (float v : out.data) CHECK(v <= 1.0f + 1e-5f);
+    for (int y = 0; y < 64; ++y)
+        for (int x = 0; x < 64; ++x)
+            for (int c = 0; c < 3; ++c) {
+                const float s = src.px(x, y)[c], gl = g.px(x, y)[c];
+                CHECK(std::fabs(out.px(x, y)[c] - (s + gl * (1.0f - s))) < 1e-5f);
+                if (gl <= 1.0f) CHECK(out.px(x, y)[c] <= 1.0f + 1e-5f);  // whites stay white
+            }
     p.blend = Blend::Add;
+    p.exposure = 3.0f;
     const Image add = render_premultiplied(src, p);
     CHECK(add.px(32, 32)[0] > 1.0f);  // add does blow past 1
+}
+
+static void test_depth_spread_widens_far_sources() {
+    Image src(128, 128, 3);
+    for (int c = 0; c < 3; ++c) src.px(64, 64)[c] = 1.0f;
+    GlowParams p;
+    p.radius = 40.0f;
+    Image near(128, 128, 1), far(128, 128, 1);
+    for (float& v : far.data) v = 1.0f;
+    p.depth_spread = 1.0f;
+    const Image gn = glow_layer(src, p, &near), gf = glow_layer(src, p, &far);
+    p.depth_spread = 0.0f;
+    const Image g0 = glow_layer(src, p, &far);
+    for (size_t i = 0; i < g0.data.size(); ++i) CHECK(std::fabs(gn.data[i] - g0.data[i]) < 1e-6f);  // near: no change
+    CHECK(gf.px(64, 64)[0] < g0.px(64, 64)[0]);  // far: less core, more halo
+    CHECK(gf.px(64 + 30, 64)[0] > g0.px(64 + 30, 64)[0]);
+    CHECK(std::fabs(channel_sum(gf, 0) - channel_sum(g0, 0)) < 0.02 * channel_sum(g0, 0));  // same energy
+}
+
+static void test_occlusion_masks_far_glow_on_near_pixels() {
+    Image src(128, 64, 3), depth(128, 64, 1);
+    for (int c = 0; c < 3; ++c) src.px(32, 32)[c] = 1.0f;  // far light on the left
+    for (int y = 0; y < 64; ++y)
+        for (int x = 0; x < 128; ++x) depth.px(x, y)[0] = x < 64 ? 1.0f : 0.0f;  // near wall on the right
+    GlowParams p;
+    p.radius = 60.0f;
+    const Image open = glow_layer(src, p, &depth);
+    p.occlusion = true;
+    const Image occl = glow_layer(src, p, &depth);
+    CHECK(occl.px(80, 32)[0] < 1e-3f * open.px(80, 32)[0] + 1e-9f);  // near wall: masked
+    CHECK(std::fabs(occl.px(40, 32)[0] - open.px(40, 32)[0]) < 1e-6f);  // same depth: untouched
 }
 
 static void test_dirt_only_lights_where_glow_is() {
@@ -205,7 +245,9 @@ static void test_temporal_smooth_blends_neighbours() {
 }
 
 int main() {
-    test_screen_never_exceeds_one();
+    test_screen_composite();
+    test_depth_spread_widens_far_sources();
+    test_occlusion_masks_far_glow_on_near_pixels();
     test_dirt_only_lights_where_glow_is();
     test_temporal_smooth_blends_neighbours();
     test_premultiplied_matches_render_when_opaque();
