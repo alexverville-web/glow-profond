@@ -21,11 +21,12 @@
 #include "GlowProfond_Version.h"
 #include "glow_profond/glow.hpp"
 
-static_assert(GP_OUT_FLAGS == (PF_OutFlag_DEEP_COLOR_AWARE | PF_OutFlag_I_EXPAND_BUFFER),
+static_assert(GP_OUT_FLAGS == (PF_OutFlag_DEEP_COLOR_AWARE | PF_OutFlag_I_EXPAND_BUFFER | PF_OutFlag_WIDE_TIME_INPUT),
               "PiPL out flags out of sync with GlobalSetup");
 static_assert(GP_OUT_FLAGS_2 == (PF_OutFlag2_FLOAT_COLOR_AWARE | PF_OutFlag2_SUPPORTS_SMART_RENDER |
                                  PF_OutFlag2_SUPPORTS_THREADED_RENDERING |
-                                 PF_OutFlag2_PARAM_GROUP_START_COLLAPSED_FLAG),
+                                 PF_OutFlag2_PARAM_GROUP_START_COLLAPSED_FLAG |
+                                 PF_OutFlag2_AUTOMATIC_WIDE_TIME_INPUT),
               "PiPL out flags 2 out of sync with GlobalSetup");
 static_assert(GP_VERSION_PACKED == PF_VERSION(GP_MAJOR_VERSION, GP_MINOR_VERSION, GP_BUG_VERSION,
                                               GP_STAGE_VERSION, GP_BUILD_VERSION),
@@ -39,13 +40,17 @@ using glow_profond::Image;
 // Parameter order in the Effect Controls panel.
 enum {
     GP_INPUT = 0,
+    GP_PRESET,
     GP_RADIUS,
     GP_EXPOSURE,
     GP_SPREAD,
+    GP_SATURATION,
+    GP_BLEND,
     GP_INPUT_GROUP,
     GP_THRESHOLD,
     GP_THRESHOLD_SMOOTH,
     GP_UNMULT,
+    GP_TEMPORAL,
     GP_INPUT_GROUP_END,
     GP_SHAPE_GROUP,
     GP_ASPECT,
@@ -59,6 +64,10 @@ enum {
     GP_TINT_MID,
     GP_TINT_HALO,
     GP_TINT_GROUP_END,
+    GP_DIRT_GROUP,
+    GP_DIRT_LAYER,
+    GP_DIRT_AMOUNT,
+    GP_DIRT_GROUP_END,
     GP_RENDER_GROUP,
     GP_GAMMA,
     GP_TONEMAP,
@@ -97,16 +106,37 @@ enum {
     ID_BASE_SIGMA,
     ID_DOWNSAMPLE,
     ID_RENDER_GROUP_END,
-    ID_VIEW
+    ID_VIEW,
+    // v0.2
+    ID_PRESET,
+    ID_SATURATION,
+    ID_BLEND,
+    ID_TEMPORAL,
+    ID_DIRT_GROUP,
+    ID_DIRT_LAYER,
+    ID_DIRT_AMOUNT,
+    ID_DIRT_GROUP_END
 };
 
 enum { TINT_NONE = 1, TINT_TWO, TINT_THREE };
-enum { VIEW_FINAL = 1, VIEW_GLOW, VIEW_SOURCE };
+enum { VIEW_FINAL = 1, VIEW_GLOW, VIEW_SOURCE, VIEW_BEHIND };
+enum { BLEND_ADD = 1, BLEND_SCREEN };
+enum { PRESET_CUSTOM = 1, PRESET_NEON, PRESET_SOFT_SUN, PRESET_CINE, PRESET_ANAMORPHIC, PRESET_TEXT, PRESET_SUBTLE,
+       PRESET_COUNT = PRESET_SUBTLE };
+
+// Checkout ids for the extra layer requests (distinct from parameter indices).
+enum { CHECKOUT_PREV = 1000, CHECKOUT_NEXT, CHECKOUT_DIRT };
 
 // What PreRender decided, handed to SmartRender.
 struct RenderPlan {
     PF_LRect input_rect;   // layer-space rect covered by the input world
     PF_LRect output_rect;  // layer-space rect covered by the output world
+    PF_LRect prev_rect;    // neighbouring frames (anti-flicker), empty if unused
+    PF_LRect next_rect;
+    bool dirt = false;     // a lens dirt layer was checked out
+    PF_LRect dirt_rect;    // in the dirt layer's own space
+    A_long layer_width;    // effect layer size at render resolution, for the dirt mapping
+    A_long layer_height;
 };
 
 void DeleteRenderPlan(void* plan) { delete static_cast<RenderPlan*>(plan); }
@@ -153,7 +183,8 @@ PF_Err ReadParams(PF_InData* in_data, PF_OutData* out_data, GlowParams& p) {
                                        GP_THRESHOLD_SMOOTH, GP_UNMULT, GP_ASPECT, GP_RADIUS_R,
                                        GP_RADIUS_G,  GP_RADIUS_B,  GP_TINT_MODE,  GP_TINT_CORE,
                                        GP_TINT_MID,  GP_TINT_HALO, GP_GAMMA,      GP_TONEMAP,
-                                       GP_BASE_SIGMA, GP_DOWNSAMPLE, GP_VIEW};
+                                       GP_BASE_SIGMA, GP_DOWNSAMPLE, GP_VIEW,       GP_SATURATION,
+                                       GP_BLEND,     GP_TEMPORAL,  GP_DIRT_AMOUNT};
     PF_ParamDef defs[GP_NUM_PARAMS];
     bool checked_out[GP_NUM_PARAMS] = {};
     for (int index : kValueParams) {
@@ -178,10 +209,15 @@ PF_Err ReadParams(PF_InData* in_data, PF_OutData* out_data, GlowParams& p) {
         p.gamma_correct = defs[GP_GAMMA].u.bd.value != 0;
         p.tonemap = defs[GP_TONEMAP].u.bd.value != 0;
         p.downsample = 1 << std::clamp<A_long>(defs[GP_DOWNSAMPLE].u.pd.value - 1, 0, 3);
+        p.saturation = ToFloat(defs[GP_SATURATION]) / 100.0f;
+        p.blend = defs[GP_BLEND].u.pd.value == BLEND_SCREEN ? glow_profond::Blend::Screen : glow_profond::Blend::Add;
+        p.temporal_smooth = ToFloat(defs[GP_TEMPORAL]) / 100.0f;
+        p.dirt_amount = ToFloat(defs[GP_DIRT_AMOUNT]) / 100.0f;
 
         switch (defs[GP_VIEW].u.pd.value) {
             case VIEW_GLOW: p.view = glow_profond::View::Glow; break;
             case VIEW_SOURCE: p.view = glow_profond::View::Source; break;
+            case VIEW_BEHIND: p.view = glow_profond::View::Behind; break;
             default: p.view = glow_profond::View::Final; break;
         }
 
@@ -218,18 +254,57 @@ A_long GlowPadding(const GlowParams& p) {
     return static_cast<A_long>(std::ceil(std::min(reach, 30000.0f)));
 }
 
+// Copies world into img at (dx, dy); whatever falls outside img is dropped
+// (neighbouring frames can cover a different rect than the current one).
 template <class Pixel>
 void ReadPixels(const PF_EffectWorld* world, float max_value, Image& img, int dx, int dy) {
+    const int x_lo = std::max(0, -dx), x_hi = std::min(int(world->width), img.width - dx);
     glow_profond::parallel_for_rows(int(world->height), [&](int y) {
+        if (y + dy < 0 || y + dy >= img.height) return;
         const Pixel* row = reinterpret_cast<const Pixel*>(reinterpret_cast<const char*>(world->data) + y * world->rowbytes);
-        for (A_long x = 0; x < world->width; ++x) {
-            float* o = img.px(int(x) + dx, y + dy);
+        for (int x = x_lo; x < x_hi; ++x) {
+            float* o = img.px(x + dx, y + dy);
             o[0] = float(row[x].red) / max_value;
             o[1] = float(row[x].green) / max_value;
             o[2] = float(row[x].blue) / max_value;
             o[3] = float(row[x].alpha) / max_value;
         }
     });
+}
+
+// ReadPixels for whichever depth AE handed us.
+PF_Err ReadWorld(PF_PixelFormat format, const PF_EffectWorld* world, Image& img, int dx, int dy) {
+    switch (format) {
+        case PF_PixelFormat_ARGB128: ReadPixels<PF_PixelFloat>(world, 1.0f, img, dx, dy); return PF_Err_NONE;
+        case PF_PixelFormat_ARGB64: ReadPixels<PF_Pixel16>(world, float(PF_MAX_CHAN16), img, dx, dy); return PF_Err_NONE;
+        case PF_PixelFormat_ARGB32: ReadPixels<PF_Pixel8>(world, float(PF_MAX_CHAN8), img, dx, dy); return PF_Err_NONE;
+        default: return PF_Err_BAD_CALLBACK_PARAM;
+    }
+}
+
+// Stretches the dirt texture (tex) over the effect layer, sampled for each
+// pixel of the work buffer whose top-left is at layer (left, top).
+Image ResampleDirt(const Image& tex, A_long layer_w, A_long layer_h, A_long left, A_long top, int width, int height) {
+    Image out(width, height, 4);
+    if (tex.width == 0 || tex.height == 0 || layer_w <= 0 || layer_h <= 0) return out;
+    const float sx = float(tex.width) / float(layer_w), sy = float(tex.height) / float(layer_h);
+    glow_profond::parallel_for_rows(height, [&](int y) {
+        const float v = std::clamp((float(top + y) + 0.5f) * sy - 0.5f, 0.0f, float(tex.height - 1));
+        const int y0 = int(v), y1 = std::min(y0 + 1, tex.height - 1);
+        const float fy = v - float(y0);
+        for (int x = 0; x < width; ++x) {
+            const float u = std::clamp((float(left + x) + 0.5f) * sx - 0.5f, 0.0f, float(tex.width - 1));
+            const int x0 = int(u), x1 = std::min(x0 + 1, tex.width - 1);
+            const float fx = u - float(x0);
+            float* o = out.px(x, y);
+            for (int c = 0; c < 4; ++c) {
+                const float t = tex.px(x0, y0)[c] + (tex.px(x1, y0)[c] - tex.px(x0, y0)[c]) * fx;
+                const float b = tex.px(x0, y1)[c] + (tex.px(x1, y1)[c] - tex.px(x0, y1)[c]) * fx;
+                o[c] = t + (b - t) * fy;
+            }
+        }
+    });
+    return out;
 }
 
 // 8x8 Bayer matrix: an ordered dither breaks the banding that wide, smooth
@@ -285,11 +360,20 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data) {
     PF_ParamDef def;
 
     AEFX_CLR_STRUCT(def);
+    PF_ADD_POPUPX("Preset", PRESET_COUNT, PRESET_CUSTOM,
+                  "Personnalise|Neon|Soleil doux|Cine|Anamorphique|Texte lumineux|Bloom subtil",
+                  PF_ParamFlag_SUPERVISE | PF_ParamFlag_CANNOT_TIME_VARY, ID_PRESET);
+    AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Rayon", 0, 4000, 0, 1000, 400, PF_Precision_TENTHS, 0, 0, ID_RADIUS);
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Exposition", -10, 10, -4, 4, 0, PF_Precision_HUNDREDTHS, 0, 0, ID_EXPOSURE);
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Diffusion (falloff)", 0.5, 4, 1, 3, 2, PF_Precision_HUNDREDTHS, 0, 0, ID_SPREAD);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("Saturation", 0, 300, 0, 200, 100, PF_Precision_INTEGER, PF_ValueDisplayFlag_PERCENT, 0,
+                         ID_SATURATION);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_POPUP("Mode de fusion", 2, BLEND_ADD, "Ajout|Ecran", ID_BLEND);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_TOPIC("Entree", ID_INPUT_GROUP);
@@ -299,6 +383,9 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data) {
     PF_ADD_FLOAT_SLIDERX("Douceur du seuil", 0, 1, 0, 1, 0.5, PF_Precision_HUNDREDTHS, 0, 0, ID_THRESHOLD_SMOOTH);
     AEFX_CLR_STRUCT(def);
     PF_ADD_CHECKBOXX("Unmult (alpha = luma)", FALSE, 0, ID_UNMULT);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("Anti-scintillement", 0, 100, 0, 100, 0, PF_Precision_INTEGER, PF_ValueDisplayFlag_PERCENT,
+                         0, ID_TEMPORAL);
     AEFX_CLR_STRUCT(def);
     PF_END_TOPIC(ID_INPUT_GROUP_END);
 
@@ -329,6 +416,16 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data) {
     PF_END_TOPIC(ID_TINT_GROUP_END);
 
     AEFX_CLR_STRUCT(def);
+    PF_ADD_TOPIC("Salete de lentille", ID_DIRT_GROUP);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_LAYER("Texture", PF_LayerDefault_NONE, ID_DIRT_LAYER);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("Intensite salete", 0, 1000, 0, 200, 100, PF_Precision_INTEGER, PF_ValueDisplayFlag_PERCENT,
+                         0, ID_DIRT_AMOUNT);
+    AEFX_CLR_STRUCT(def);
+    PF_END_TOPIC(ID_DIRT_GROUP_END);
+
+    AEFX_CLR_STRUCT(def);
     PF_ADD_TOPIC("Rendu", ID_RENDER_GROUP);
     AEFX_CLR_STRUCT(def);
     PF_ADD_CHECKBOXX("Correction gamma", TRUE, 0, ID_GAMMA);
@@ -337,15 +434,91 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data) {
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Sigma de base", 0.5, 8, 0.5, 4, 1.5, PF_Precision_HUNDREDTHS, 0, 0, ID_BASE_SIGMA);
     AEFX_CLR_STRUCT(def);
-    PF_ADD_POPUP("Sous-echantillonnage", 4, 1, "1x|2x|4x|8x", ID_DOWNSAMPLE);
+    PF_ADD_POPUP("Qualite", 4, 1, "Maximale (1x)|Haute (2x)|Moyenne (4x)|Brouillon (8x)", ID_DOWNSAMPLE);
     AEFX_CLR_STRUCT(def);
     PF_END_TOPIC(ID_RENDER_GROUP_END);
 
     AEFX_CLR_STRUCT(def);
-    PF_ADD_POPUP("Affichage", 3, VIEW_FINAL, "Resultat final|Glow seul|Source", ID_VIEW);
+    PF_ADD_POPUP("Affichage", 4, VIEW_FINAL, "Resultat final|Glow seul|Source|Glow derriere", ID_VIEW);
 
     out_data->num_params = GP_NUM_PARAMS;
     return err;
+}
+
+// What a preset sets. Everything else (view, quality, dirt, anti-flicker,
+// unmult, gamma) is left as the user had it.
+struct Preset {
+    float radius, exposure, spread, saturation;  // saturation in %
+    A_long blend;
+    float threshold, threshold_smooth, aspect;
+    float rgb_radius[3];
+    A_long tint_mode;
+    A_u_char core[3], mid[3], halo[3];
+    bool tonemap;
+};
+
+// Indexed by PRESET_* - 2 (Personnalise sets nothing).
+const Preset kPresets[] = {
+    // Neon: tight, saturated, colour kept.
+    {250, 0.5f, 2.2f, 140, BLEND_ADD, 0.3f, 0.5f, 1, {1, 1, 1}, TINT_NONE,
+     {255, 255, 255}, {255, 102, 204}, {77, 77, 255}, false},
+    // Soleil doux: huge warm halo, screened so whites hold.
+    {800, -0.5f, 1.6f, 90, BLEND_SCREEN, 0.6f, 0.8f, 1, {1, 1, 1}, TINT_TWO,
+     {255, 250, 235}, {255, 200, 140}, {255, 170, 90}, true},
+    // Cine: highlights only, a hint of chromatic spread, ACES.
+    {500, 0, 2, 100, BLEND_ADD, 0.8f, 0.6f, 1, {1.15f, 1, 0.85f}, TINT_NONE,
+     {255, 255, 255}, {255, 102, 204}, {77, 77, 255}, true},
+    // Anamorphique: wide horizontal streak, blue halo.
+    {600, 0, 2, 120, BLEND_ADD, 0.7f, 0.5f, 6, {1, 1, 1}, TINT_TWO,
+     {255, 255, 255}, {160, 190, 255}, {80, 140, 255}, true},
+    // Texte lumineux: whole shape glows, close and bright.
+    {120, 1, 2.4f, 120, BLEND_ADD, 0, 0.5f, 1, {1, 1, 1}, TINT_NONE,
+     {255, 255, 255}, {255, 102, 204}, {77, 77, 255}, false},
+    // Bloom subtil: a soft lift of the brightest areas.
+    {300, -2, 1.8f, 100, BLEND_SCREEN, 0.9f, 0.5f, 1, {1, 1, 1}, TINT_NONE,
+     {255, 255, 255}, {255, 102, 204}, {77, 77, 255}, false},
+};
+static_assert(sizeof(kPresets) / sizeof(kPresets[0]) == PRESET_COUNT - 1, "one entry per preset");
+
+PF_Err UserChangedParam(PF_ParamDef* params[], const PF_UserChangedParamExtra* extra) {
+    if (extra->param_index != GP_PRESET) return PF_Err_NONE;
+    const A_long choice = params[GP_PRESET]->u.pd.value;
+    if (choice <= PRESET_CUSTOM || choice > PRESET_COUNT) return PF_Err_NONE;
+    const Preset& pr = kPresets[choice - 2];
+
+    auto set_float = [&](int index, float v) {
+        params[index]->u.fs_d.value = v;
+        params[index]->uu.change_flags |= PF_ChangeFlag_CHANGED_VALUE;
+    };
+    auto set_popup = [&](int index, A_long v) {
+        params[index]->u.pd.value = v;
+        params[index]->uu.change_flags |= PF_ChangeFlag_CHANGED_VALUE;
+    };
+    auto set_color = [&](int index, const A_u_char (&c)[3]) {
+        params[index]->u.cd.value.red = c[0];
+        params[index]->u.cd.value.green = c[1];
+        params[index]->u.cd.value.blue = c[2];
+        params[index]->u.cd.value.alpha = 255;
+        params[index]->uu.change_flags |= PF_ChangeFlag_CHANGED_VALUE;
+    };
+    set_float(GP_RADIUS, pr.radius);
+    set_float(GP_EXPOSURE, pr.exposure);
+    set_float(GP_SPREAD, pr.spread);
+    set_float(GP_SATURATION, pr.saturation);
+    set_popup(GP_BLEND, pr.blend);
+    set_float(GP_THRESHOLD, pr.threshold);
+    set_float(GP_THRESHOLD_SMOOTH, pr.threshold_smooth);
+    set_float(GP_ASPECT, pr.aspect);
+    set_float(GP_RADIUS_R, pr.rgb_radius[0]);
+    set_float(GP_RADIUS_G, pr.rgb_radius[1]);
+    set_float(GP_RADIUS_B, pr.rgb_radius[2]);
+    set_popup(GP_TINT_MODE, pr.tint_mode);
+    set_color(GP_TINT_CORE, pr.core);
+    set_color(GP_TINT_MID, pr.mid);
+    set_color(GP_TINT_HALO, pr.halo);
+    params[GP_TONEMAP]->u.bd.value = pr.tonemap;
+    params[GP_TONEMAP]->uu.change_flags |= PF_ChangeFlag_CHANGED_VALUE;
+    return PF_Err_NONE;
 }
 
 PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* extra) {
@@ -373,6 +546,45 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
     if (!plan) return PF_Err_OUT_OF_MEMORY;
     plan->input_rect = in_result.result_rect;
     plan->output_rect = extra->output->result_rect;
+    plan->prev_rect = plan->next_rect = plan->dirt_rect = PF_LRect{0, 0, 0, 0};
+    plan->dirt = false;
+    plan->layer_width = A_long(std::lround(double(in_data->width) * in_data->downsample_x.num /
+                                           std::max<A_long>(in_data->downsample_x.den, 1)));
+    plan->layer_height = A_long(std::lround(double(in_data->height) * in_data->downsample_y.num /
+                                            std::max<A_long>(in_data->downsample_y.den, 1)));
+    const bool glows = p.view != glow_profond::View::Source;
+
+    // Anti-flicker: the frames before and after feed the glow source. With
+    // PF_OutFlag2_AUTOMATIC_WIDE_TIME_INPUT, AE tracks these dependencies.
+    if (!err && glows && p.temporal_smooth > 0.0f) {
+        const A_long times[2] = {in_data->current_time - in_data->time_step,
+                                 in_data->current_time + in_data->time_step};
+        PF_LRect* rects[2] = {&plan->prev_rect, &plan->next_rect};
+        for (int i = 0; i < 2 && !err; ++i) {
+            PF_CheckoutResult r;
+            AEFX_CLR_STRUCT(r);
+            err = extra->cb->checkout_layer(in_data->effect_ref, GP_INPUT, CHECKOUT_PREV + i, &req, times[i],
+                                            in_data->time_step, in_data->time_scale, &r);
+            if (!err) *rects[i] = r.result_rect;
+        }
+    }
+    // Lens dirt: the whole texture layer, stretched over the effect layer.
+    if (!err && glows && p.dirt_amount > 0.0f) {
+        PF_RenderRequest dreq = req;
+        dreq.rect = PF_LRect{0, 0, 30000, 30000};  // clipped by AE to the texture's bounds
+        PF_CheckoutResult r;
+        AEFX_CLR_STRUCT(r);
+        err = extra->cb->checkout_layer(in_data->effect_ref, GP_DIRT_LAYER, CHECKOUT_DIRT, &dreq,
+                                        in_data->current_time, in_data->time_step, in_data->time_scale, &r);
+        if (!err && !IsEmpty(r.result_rect)) {
+            plan->dirt = true;
+            plan->dirt_rect = r.result_rect;
+        }
+    }
+    if (err) {
+        delete plan;
+        return err;
+    }
     extra->output->pre_render_data = plan;
     extra->output->delete_pre_render_data_func = DeleteRenderPlan;
     return err;
@@ -426,19 +638,53 @@ PF_Err SmartRender(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra
             }
         }
         if (!err && src.width > 0 && src.height > 0) {
-            const Image result = glow_profond::render_premultiplied(src, p);
-            const A_long ox = plan->output_rect.left, oy = plan->output_rect.top;
-            switch (format) {
-                case PF_PixelFormat_ARGB128:
-                    WritePixels<PF_PixelFloat, PF_FpShort>(result, out_dx, out_dy, 1.0f, false, ox, oy, output);
-                    break;
-                case PF_PixelFormat_ARGB64:
-                    WritePixels<PF_Pixel16, A_u_short>(result, out_dx, out_dy, float(PF_MAX_CHAN16), true, ox, oy,
-                                                       output);
-                    break;
-                default:
-                    WritePixels<PF_Pixel8, A_u_char>(result, out_dx, out_dy, float(PF_MAX_CHAN8), true, ox, oy, output);
-                    break;
+            // Optional inputs: neighbouring frames and the dirt texture,
+            // each checked back in as soon as it is copied.
+            glow_profond::GlowInputs inputs;
+            Image prev, next, dirt;
+            const PF_LRect* nb_rects[2] = {&plan->prev_rect, &plan->next_rect};
+            Image* nb_imgs[2] = {&prev, &next};
+            for (int i = 0; i < 2 && !err; ++i) {
+                if (IsEmpty(*nb_rects[i])) continue;
+                PF_EffectWorld* w = nullptr;
+                ERR(extra->cb->checkout_layer_pixels(in_data->effect_ref, CHECKOUT_PREV + i, &w));
+                if (!err && w && w->data) {
+                    *nb_imgs[i] = Image(src.width, src.height, 4);
+                    ERR(ReadWorld(format, w, *nb_imgs[i], int(nb_rects[i]->left - bounds.left),
+                                  int(nb_rects[i]->top - bounds.top)));
+                    if (!err) inputs.neighbors.push_back(nb_imgs[i]);
+                }
+                if (w) ERR2(extra->cb->checkin_layer_pixels(in_data->effect_ref, CHECKOUT_PREV + i));
+            }
+            if (!err && plan->dirt) {
+                PF_EffectWorld* w = nullptr;
+                ERR(extra->cb->checkout_layer_pixels(in_data->effect_ref, CHECKOUT_DIRT, &w));
+                if (!err && w && w->data) {
+                    Image tex(int(w->width), int(w->height), 4);
+                    ERR(ReadWorld(format, w, tex, 0, 0));
+                    if (!err) {
+                        dirt = ResampleDirt(tex, plan->layer_width, plan->layer_height, bounds.left, bounds.top,
+                                            src.width, src.height);
+                        inputs.dirt = &dirt;
+                    }
+                }
+                if (w) ERR2(extra->cb->checkin_layer_pixels(in_data->effect_ref, CHECKOUT_DIRT));
+            }
+            if (!err) {
+                const Image result = glow_profond::render_premultiplied(src, p, inputs);
+                const A_long ox = plan->output_rect.left, oy = plan->output_rect.top;
+                switch (format) {
+                    case PF_PixelFormat_ARGB128:
+                        WritePixels<PF_PixelFloat, PF_FpShort>(result, out_dx, out_dy, 1.0f, false, ox, oy, output);
+                        break;
+                    case PF_PixelFormat_ARGB64:
+                        WritePixels<PF_Pixel16, A_u_short>(result, out_dx, out_dy, float(PF_MAX_CHAN16), true, ox, oy,
+                                                           output);
+                        break;
+                    default:
+                        WritePixels<PF_Pixel8, A_u_char>(result, out_dx, out_dy, float(PF_MAX_CHAN8), true, ox, oy, output);
+                        break;
+                }
             }
         }
     }
@@ -461,13 +707,14 @@ extern "C" DllExport PF_Err PluginDataEntryFunction2(PF_PluginDataPtr inPtr, PF_
 
 extern "C" DllExport PF_Err EffectMain(PF_Cmd cmd, PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[],
                                        PF_LayerDef* output, void* extra) {
-    (void)params;
     (void)output;
     try {
         switch (cmd) {
             case PF_Cmd_ABOUT: return About(in_data, out_data);
             case PF_Cmd_GLOBAL_SETUP: return GlobalSetup(out_data);
             case PF_Cmd_PARAMS_SETUP: return ParamsSetup(in_data, out_data);
+            case PF_Cmd_USER_CHANGED_PARAM:
+                return UserChangedParam(params, static_cast<const PF_UserChangedParamExtra*>(extra));
             case PF_Cmd_SMART_PRE_RENDER:
                 return PreRender(in_data, out_data, static_cast<PF_PreRenderExtra*>(extra));
             case PF_Cmd_SMART_RENDER:

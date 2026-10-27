@@ -387,6 +387,19 @@ float smoothstep(float e0, float e1, float x) {
     return t * t * (3.0f - 2.0f * t);
 }
 
+// Saturated sources glow towards white in the core; scaling the chroma
+// around the Rec. 709 luma lets a neon keep (or lose) its colour.
+void saturate(Image& glow, float s) {
+    if (s == 1.0f) return;
+    parallel_rows(glow.height, [&](int y) {
+        float* a = glow.px(0, y);
+        for (int x = 0; x < glow.width; ++x, a += 3) {
+            const float luma = 0.2126f * a[0] + 0.7152f * a[1] + 0.0722f * a[2];
+            for (int c = 0; c < 3; ++c) a[c] = std::max(luma + s * (a[c] - luma), 0.0f);
+        }
+    });
+}
+
 // First channel of img as a 1-channel map of size W x H (bilinear if needed).
 Image depth_map(const Image& img, int W, int H) {
     Image d(img.width, img.height, 1);
@@ -543,7 +556,10 @@ Image glow_layer(const Image& src, const GlowParams& p, const Image* depth, cons
         acc = upsample_tent2_add(acc, lvl.width, lvl.height, &lvl);
     }
     if (acc.width != W || acc.height != H) acc = upsample_to(acc, W, H);
-    if (ac == 3) return acc;
+    if (ac == 3) {
+        saturate(acc, p.saturation);
+        return acc;
+    }
 
     Image d_full, dirt_full;
     if (occlude) d_full = depth_map(*depth, W, H);
@@ -568,6 +584,7 @@ Image glow_layer(const Image& src, const GlowParams& p, const Image* depth, cons
             }
         }
     });
+    saturate(glow, p.saturation);
     return glow;
 }
 
@@ -583,6 +600,7 @@ float composite(float base, float glow, Blend blend) {
 Image render(const Image& src, const GlowParams& p, const Image* depth, const Image* dirt) {
     const int W = src.width, H = src.height;
     Image lin(W, H, 3);
+    std::vector<float> coverage(size_t(W) * H);
     parallel_rows(H, [&](int y) {
         for (int x = 0; x < W; ++x) {
             const float* s = src.px(x, y);
@@ -594,6 +612,7 @@ Image render(const Image& src, const GlowParams& p, const Image* depth, const Im
             }
             float* o = lin.px(x, y);
             for (int c = 0; c < 3; ++c) o[c] = (p.gamma_correct ? srgb_to_linear(rgb[c]) : rgb[c]) * alpha;
+            coverage[size_t(y) * W + x] = alpha;
         }
     });
 
@@ -613,7 +632,11 @@ Image render(const Image& src, const GlowParams& p, const Image* depth, const Im
         if (p.view == View::Glow) {
             out = g;
         } else {
-            for (size_t i = 0; i < out.data.size(); ++i) out.data[i] = composite(out.data[i], g.data[i], p.blend);
+            for (size_t i = 0; i < out.data.size(); ++i) {
+                // Behind: the glow passes under the layer, through its transparency.
+                const float under = p.view == View::Behind ? 1.0f - coverage[i / 3] : 1.0f;
+                out.data[i] = composite(out.data[i], under * g.data[i], p.blend);
+            }
         }
     }
     parallel_rows(H, [&](int y) {
@@ -717,7 +740,9 @@ Image render_premultiplied(const Image& src, const GlowParams& p, const GlowInpu
                     for (int c = 0; c < 3; ++c) premult[c] = g[c];
                     a = coverage;
                 } else {
-                    for (int c = 0; c < 3; ++c) premult[c] = composite(premult[c], g[c], p.blend);
+                    // Behind: the glow passes under the layer, through its transparency.
+                    const float under = p.view == View::Behind ? 1.0f - a : 1.0f;
+                    for (int c = 0; c < 3; ++c) premult[c] = composite(premult[c], under * g[c], p.blend);
                     a = a + (1.0f - a) * coverage;  // glow extends the layer's coverage
                 }
             }

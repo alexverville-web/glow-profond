@@ -24,12 +24,13 @@ class GlowParams:
     tonemap: bool = False            # ACES-fitted curve on the composite
     base_sigma: float = 1.5          # sigma of the tightest level, in pixels
     downsample: int = 1              # extra global downsample (speed / stylized grain)
-    view: str = "final"              # "final" | "glow" | "source"
+    view: str = "final"              # "final" | "glow" | "source" | "behind" (glow only where alpha < 1)
     blend: str = "add"               # "add" | "screen" (screen never pushes src <= 1 past 1)
     dirt_amount: float = 0.0         # lens dirt strength (needs a dirt texture)
     depth_spread: float = 0.0        # 0..1: far sources (depth 1) push energy to wide levels
     occlusion: bool = False          # nearer pixels mask the glow of farther sources
     occlusion_softness: float = 0.05  # depth range of the occlusion smoothstep
+    saturation: float = 1.0          # glow saturation around its Rec. 709 luma (0 grey, 2 double)
 
 
 def srgb_to_linear(x):
@@ -246,7 +247,12 @@ def glow_layer(src_lin, p: GlowParams, depth=None, dirt=None):
         glow = glow * (1.0 - smoothstep(0.0, p.occlusion_softness, d_mean - d_full))
     if dirt is not None and p.dirt_amount > 0:
         glow = glow + p.dirt_amount * _resize_to(np.asarray(dirt, np.float32)[..., :3], (H, W)) * large
-    return glow * 2.0 ** p.exposure
+    glow = glow * 2.0 ** p.exposure
+    if p.saturation != 1.0:
+        # Scale the chroma around the luma: a neon keeps (or loses) its colour.
+        luma = glow @ np.array([0.2126, 0.7152, 0.0722], np.float32)
+        glow = np.maximum(luma[..., None] + p.saturation * (glow - luma[..., None]), 0.0)
+    return glow
 
 
 def composite(src, glow, blend):
@@ -276,7 +282,12 @@ def render(src, p: GlowParams, depth=None, dirt=None):
         if dirt is not None and p.gamma_correct:
             dirt = srgb_to_linear(np.asarray(dirt, np.float32)[..., :3])
         g = glow_layer(lin_premult, p, depth=depth, dirt=dirt)
-        out = g if p.view == "glow" else composite(lin_premult, g, p.blend)
+        if p.view == "glow":
+            out = g
+        elif p.view == "behind":
+            out = composite(lin_premult, g * (1 - alpha), p.blend)  # the halo passes under the layer
+        else:
+            out = composite(lin_premult, g, p.blend)
     if p.tonemap:
         out = aces_fitted(out)
     out = linear_to_srgb(out) if p.gamma_correct else out

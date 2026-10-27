@@ -47,6 +47,10 @@ CASES = [
                                         downsample=2, dirt_amount=1.0),
      ["--radius", "150", "--depth-spread", "0.5", "--occlusion", "--occlusion-softness", "0.2",
       "--downsample", "2", "--dirt-amount", "1", "--depth", "@depth", "--dirt", "@dirt"]),
+    ("saturation", GlowParams(radius=120, saturation=1.8), ["--radius", "120", "--saturation", "1.8"]),
+    ("desaturated", GlowParams(radius=120, saturation=0.0), ["--radius", "120", "--saturation", "0"]),
+    ("behind_unmult", GlowParams(radius=80, unmult=True, view="behind"),
+     ["--radius", "80", "--unmult", "--view", "behind"]),
 ]
 
 

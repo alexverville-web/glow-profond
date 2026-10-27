@@ -38,18 +38,26 @@ Profond**.
 
 | Paramètre AE | Champ `GlowParams` |
 | --- | --- |
+| Preset | aucun : remplit les réglages ci-dessous (Néon, Soleil doux, Ciné, Anamorphique, Texte lumineux, Bloom subtil). Laisse intacts l'affichage, la qualité, la saleté, l'anti-scintillement, l'unmult et le gamma |
 | Rayon | `radius` (σ du niveau le plus large, en px) |
 | Exposition | `exposure` (stops) |
 | Diffusion (falloff) | `spread` (2 = 1/r²) |
+| Saturation | `saturation` (%, 100 = inchangé, 0 = gris) |
+| Mode de fusion | `blend` : Ajout ou Écran (le glow ne fait pas sauter les blancs) |
 | Entrée › Seuil, Douceur du seuil | `threshold`, `threshold_smooth` |
 | Entrée › Unmult | `unmult` |
+| Entrée › Anti-scintillement | `temporal_smooth` (%) : mélange les images voisines (t ± 1 image) dans la source du glow |
 | Forme › Ratio d'aspect | `aspect` |
 | Forme › Rayon rouge / vert / bleu | `rgb_radius` |
-| Teinte › Mode, couleurs coeur / milieu / halo | `tint` (1, 2 ou 3 couleurs) |
+| Teinte › Mode, couleurs cœur / milieu / halo | `tint` (1, 2 ou 3 couleurs) |
+| Saleté de lentille › Texture, Intensité saleté | `GlowInputs::dirt` (calque étiré sur le calque de l'effet), `dirt_amount` (%) |
 | Rendu › Correction gamma | `gamma_correct` (à couper dans un projet linéaire 32 bpc) |
 | Rendu › Tonemap ACES | `tonemap` |
-| Rendu › Sigma de base, Sous-échantillonnage | `base_sigma`, `downsample` |
-| Affichage | `view` |
+| Rendu › Sigma de base, Qualité | `base_sigma`, `downsample` (Maximale 1x … Brouillon 8x) |
+| Affichage | `view` : Résultat final, Glow seul, Source, Glow derrière (le glow passe sous le calque) |
+
+Les nouveaux paramètres ont des identifiants disque ajoutés en fin de liste :
+les projets enregistrés avec la v0.1 s'ouvrent toujours.
 
 Les tailles en pixels (rayon, sigma de base) suivent la résolution de
 l'aperçu : un aperçu en demi-résolution garde le même look.
@@ -63,8 +71,12 @@ l'aperçu : un aperçu en demi-résolution garde le même look.
   `render()` (testé).
 - Le buffer de sortie est agrandi de 3 × rayon autour du calque
   (`PF_OutFlag_I_EXPAND_BUFFER`), limité à la zone demandée par AE.
-- Le rendu est sur CPU, multithreadé. Le portage GPU (Metal) est la prochaine
-  étape de performance.
+- Le rendu est sur CPU, multithreadé. Le portage GPU (Metal) est en cours
+  dans `gpu/metal/`.
+- Sorties 8 et 16 bpc : dither ordonné 8×8 (ancré dans l'espace du calque)
+  contre le banding des grands halos ; la couleur reste ≤ alpha.
+- Anti-scintillement : l'effet demande les images t − 1 et t + 1
+  (`PF_OutFlag2_AUTOMATIC_WIDE_TIME_INPUT`) seulement quand le réglage est > 0.
 
 ## Limites connues
 
