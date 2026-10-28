@@ -58,6 +58,7 @@ enum {
     GP_SATURATION,
     GP_BLEND,
     GP_VIEW,
+    GP_SOURCE_OPACITY,
     GP_TINT_GROUP,
     GP_TINT_MODE,
     GP_TINT_CORE,
@@ -66,6 +67,9 @@ enum {
     GP_TINT_GROUP_END,
     GP_CHROMA_GROUP,
     GP_CHROMA_ENABLE,
+    GP_CA_AMOUNT,
+    GP_CA_CHANNELS,
+    GP_CA_OFFSET,
     GP_RADIUS_R,
     GP_RADIUS_G,
     GP_RADIUS_B,
@@ -73,11 +77,20 @@ enum {
     GP_ANAMORPHIC_GROUP,
     GP_ANAMORPHIC_ENABLE,
     GP_ASPECT,
+    GP_ANGLE,
     GP_ANAMORPHIC_GROUP_END,
+    GP_MASK_GROUP,
+    GP_MASK_ENABLE,
+    GP_MASK_LAYER,
+    GP_MASK_MODE,
+    GP_MASK_INVERT,
+    GP_MASK_GROUP_END,
     GP_DIRT_GROUP,
     GP_DIRT_ENABLE,
     GP_DIRT_LAYER,
     GP_DIRT_AMOUNT,
+    GP_DIRT_THRESHOLD,
+    GP_DIRT_INHERIT,
     GP_DIRT_GROUP_END,
     GP_DEPTH_GROUP,
     GP_DEPTH_ENABLE,
@@ -95,8 +108,11 @@ enum {
     GP_UNMULT,
     GP_GAMMA,
     GP_TONEMAP,
+    GP_TONEMAP_CURVE,
+    GP_TONEMAP_MIX,
     GP_BASE_SIGMA,
     GP_DOWNSAMPLE,
+    GP_EXPAND,
     GP_RENDER_GROUP_END,
     GP_NUM_PARAMS
 };
@@ -160,12 +176,33 @@ enum {
     ID_DEPTH_ENABLE,
     ID_FLICKER_GROUP,
     ID_FLICKER_ENABLE,
-    ID_FLICKER_GROUP_END
+    ID_FLICKER_GROUP_END,
+    // v0.5
+    ID_CA_AMOUNT,
+    ID_CA_CHANNELS,
+    ID_CA_OFFSET,
+    ID_ANGLE,
+    ID_MASK_GROUP,
+    ID_MASK_ENABLE,
+    ID_MASK_LAYER,
+    ID_MASK_MODE,
+    ID_MASK_INVERT,
+    ID_MASK_GROUP_END,
+    ID_TONEMAP_CURVE,
+    ID_TONEMAP_MIX,
+    ID_SOURCE_OPACITY,
+    ID_DIRT_INHERIT,
+    ID_DIRT_THRESHOLD,
+    ID_EXPAND
 };
 
 enum { TINT_NONE = 1, TINT_TWO, TINT_THREE };
 enum { VIEW_FINAL = 1, VIEW_GLOW, VIEW_SOURCE, VIEW_BEHIND };
 enum { BLEND_ADD = 1, BLEND_SCREEN };
+enum { PAIR_RB = 1, PAIR_RG, PAIR_GB };
+enum { MASK_ALPHA = 1, MASK_LUMA };
+enum { CURVE_ACES = 1, CURVE_FILMIC, CURVE_REINHARD };
+enum { EXPAND_AUTO = 1, EXPAND_OFF };
 enum { PRESET_CUSTOM = 1, PRESET_NEON, PRESET_SOFT_SUN, PRESET_CINE, PRESET_ANAMORPHIC, PRESET_TEXT, PRESET_SUBTLE,
        PRESET_COUNT = PRESET_SUBTLE };
 
@@ -174,7 +211,7 @@ enum { PRESET_CUSTOM = 1, PRESET_NEON, PRESET_SOFT_SUN, PRESET_CINE, PRESET_ANAM
 float SpreadToExponent(float percent) { return 3.0f - 2.0f * std::clamp(percent, 0.0f, 100.0f) / 100.0f; }
 
 // Checkout ids for the extra layer requests (distinct from parameter indices).
-enum { CHECKOUT_PREV = 1000, CHECKOUT_NEXT, CHECKOUT_DIRT, CHECKOUT_DEPTH };
+enum { CHECKOUT_PREV = 1000, CHECKOUT_NEXT, CHECKOUT_DIRT, CHECKOUT_DEPTH, CHECKOUT_MASK };
 
 // What PreRender decided, handed to SmartRender.
 struct RenderPlan {
@@ -186,6 +223,8 @@ struct RenderPlan {
     PF_LRect dirt_rect;    // in the dirt layer's own space
     bool depth = false;    // a depth layer was checked out
     PF_LRect depth_rect;   // in the depth layer's own space
+    bool mask = false;     // an input mask layer was checked out
+    PF_LRect mask_rect;    // in the mask layer's own space
     A_long layer_width;    // effect layer size at render resolution, for the dirt mapping
     A_long layer_height;
 };
@@ -261,9 +300,16 @@ float ToFloat(const PF_ParamDef& def) { return static_cast<float>(def.u.fs_d.val
 
 // Reads every parameter at the current time. Pixel sizes are scaled to the
 // render resolution, so a half-resolution preview matches the full render.
-// invert_depth, when given, receives the "Invert Depth" checkbox,
-// which is a host-side option (not a GlowParams field).
-PF_Err ReadParams(PF_InData* in_data, PF_OutData* out_data, GlowParams& p, bool* invert_depth = nullptr) {
+// Options the wrapper handles itself (not GlowParams fields).
+struct HostOptions {
+    bool invert_depth = false;
+    bool mask = false;       // Input Mask group enabled
+    bool mask_luma = false;  // mask from luminance (else alpha)
+    bool mask_invert = false;
+    bool expand = true;      // grow the output past the layer for the glow
+};
+
+PF_Err ReadParams(PF_InData* in_data, PF_OutData* out_data, GlowParams& p, HostOptions* host = nullptr) {
     PF_Err err = PF_Err_NONE, err2 = PF_Err_NONE;
     static const int kValueParams[] = {
         GP_RADIUS,       GP_EXPOSURE,     GP_THRESHOLD,     GP_SPREAD_AMOUNT, GP_SATURATION,   GP_BLEND,
@@ -271,7 +317,9 @@ PF_Err ReadParams(PF_InData* in_data, PF_OutData* out_data, GlowParams& p, bool*
         GP_RADIUS_R,     GP_RADIUS_G,     GP_RADIUS_B,      GP_ANAMORPHIC_ENABLE, GP_ASPECT,   GP_DIRT_ENABLE,
         GP_DIRT_AMOUNT,  GP_DEPTH_ENABLE, GP_DEPTH_SPREAD,  GP_OCCLUSION,     GP_DEPTH_INVERT, GP_FLICKER_ENABLE,
         GP_TEMPORAL,     GP_THRESHOLD_SMOOTH, GP_UNMULT,    GP_GAMMA,         GP_TONEMAP,      GP_BASE_SIGMA,
-        GP_DOWNSAMPLE};
+        GP_DOWNSAMPLE,   GP_SOURCE_OPACITY, GP_CA_AMOUNT,   GP_CA_CHANNELS,   GP_CA_OFFSET,    GP_ANGLE,
+        GP_MASK_ENABLE,  GP_MASK_MODE,    GP_MASK_INVERT,   GP_DIRT_THRESHOLD, GP_DIRT_INHERIT, GP_TONEMAP_CURVE,
+        GP_TONEMAP_MIX,  GP_EXPAND};
     PF_ParamDef defs[GP_NUM_PARAMS];
     bool checked_out[GP_NUM_PARAMS] = {};
     for (int index : kValueParams) {
@@ -302,16 +350,41 @@ PF_Err ReadParams(PF_InData* in_data, PF_OutData* out_data, GlowParams& p, bool*
         p.blend = defs[GP_BLEND].u.pd.value == BLEND_SCREEN ? glow_profond::Blend::Screen : glow_profond::Blend::Add;
         // Extras only count while their group is enabled.
         p.aspect = on(GP_ANAMORPHIC_ENABLE) ? ToFloat(defs[GP_ASPECT]) : 1.0f;
-        p.rgb_radius = on(GP_CHROMA_ENABLE)
-                           ? glow_profond::Rgb{ToFloat(defs[GP_RADIUS_R]), ToFloat(defs[GP_RADIUS_G]),
-                                               ToFloat(defs[GP_RADIUS_B])}
-                           : glow_profond::Rgb{1.0f, 1.0f, 1.0f};
+        p.angle = on(GP_ANAMORPHIC_ENABLE) ? float(defs[GP_ANGLE].u.ad.value) / 65536.0f : 0.0f;
+        p.rgb_radius = {1.0f, 1.0f, 1.0f};
+        if (on(GP_CHROMA_ENABLE)) {
+            // Fine per-channel radii, then Amount pulls the chosen pair apart
+            // (first channel wider, second tighter) around the third.
+            p.rgb_radius = {ToFloat(defs[GP_RADIUS_R]), ToFloat(defs[GP_RADIUS_G]), ToFloat(defs[GP_RADIUS_B])};
+            const A_long pair = defs[GP_CA_CHANNELS].u.pd.value;
+            const int first = pair == PAIR_GB ? 1 : 0, second = pair == PAIR_RG ? 1 : 2;
+            const float a = 0.5f * ToFloat(defs[GP_CA_AMOUNT]) / 100.0f;
+            p.rgb_radius[first] *= 1.0f + a;
+            p.rgb_radius[second] *= std::max(1.0f - a, 0.05f);
+            p.ca_pair = pair == PAIR_RG ? glow_profond::ChannelPair::RG
+                      : pair == PAIR_GB ? glow_profond::ChannelPair::GB
+                                        : glow_profond::ChannelPair::RB;
+            p.ca_offset = ToFloat(defs[GP_CA_OFFSET]) * scale;  // centre and reach set at render
+        }
+        p.source_opacity = ToFloat(defs[GP_SOURCE_OPACITY]) / 100.0f;
+        p.tonemap_curve = defs[GP_TONEMAP_CURVE].u.pd.value == CURVE_FILMIC     ? glow_profond::Tonemap::Hable
+                          : defs[GP_TONEMAP_CURVE].u.pd.value == CURVE_REINHARD ? glow_profond::Tonemap::Reinhard
+                                                                                : glow_profond::Tonemap::Aces;
+        p.tonemap_mix = ToFloat(defs[GP_TONEMAP_MIX]) / 100.0f;
+        p.dirt_threshold = ToFloat(defs[GP_DIRT_THRESHOLD]) / 100.0f;
+        p.dirt_inherit_color = on(GP_DIRT_INHERIT);
         p.temporal_smooth = on(GP_FLICKER_ENABLE) ? ToFloat(defs[GP_TEMPORAL]) / 100.0f : 0.0f;
         p.dirt_amount = on(GP_DIRT_ENABLE) ? ToFloat(defs[GP_DIRT_AMOUNT]) / 100.0f : 0.0f;
         // Also need a depth layer (see SmartRender).
         p.depth_spread = on(GP_DEPTH_ENABLE) ? ToFloat(defs[GP_DEPTH_SPREAD]) : 0.0f;
         p.occlusion = on(GP_DEPTH_ENABLE) && on(GP_OCCLUSION);
-        if (invert_depth) *invert_depth = on(GP_DEPTH_INVERT);
+        if (host) {
+            host->invert_depth = on(GP_DEPTH_INVERT);
+            host->mask = on(GP_MASK_ENABLE);
+            host->mask_luma = defs[GP_MASK_MODE].u.pd.value == MASK_LUMA;
+            host->mask_invert = on(GP_MASK_INVERT);
+            host->expand = defs[GP_EXPAND].u.pd.value != EXPAND_OFF;
+        }
 
         switch (defs[GP_VIEW].u.pd.value) {
             case VIEW_GLOW: p.view = glow_profond::View::Glow; break;
@@ -351,7 +424,7 @@ A_long GlowPadding(const GlowParams& p) {
     if (p.view == glow_profond::View::Source) return 0;
     const float max_mult = std::max({p.rgb_radius[0], p.rgb_radius[1], p.rgb_radius[2], 1.0f});
     const float stretch = std::max(std::sqrt(p.aspect), 1.0f / std::sqrt(p.aspect));
-    const float reach = 4.0f * p.radius * max_mult * stretch + 4.0f * p.downsample;
+    const float reach = 4.0f * p.radius * max_mult * stretch + 4.0f * p.downsample + std::fabs(p.ca_offset);
     return static_cast<A_long>(std::ceil(std::min(reach, 30000.0f)));
 }
 
@@ -501,6 +574,9 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data) {
     PF_ADD_POPUP("Blend Mode", 2, BLEND_ADD, "Add|Screen", ID_BLEND);
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUP("View", 4, VIEW_FINAL, "Final|Glow Only|Source|Glow Behind", ID_VIEW);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("Source Opacity", 0, 100, 0, 100, 100, PF_Precision_INTEGER, PF_ValueDisplayFlag_PERCENT, 0,
+                         ID_SOURCE_OPACITY);
 
     ERR(group("Color Tint", ID_TINT_GROUP));
     AEFX_CLR_STRUCT(def);
@@ -517,11 +593,18 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data) {
     AEFX_CLR_STRUCT(def);
     PF_ADD_CHECKBOXX("Enable Chromatic Aberration", FALSE, supervised, ID_CHROMA_ENABLE);
     AEFX_CLR_STRUCT(def);
-    PF_ADD_FLOAT_SLIDERX("Red Radius", 0, 4, 0.5, 2, 1.15, PF_Precision_HUNDREDTHS, 0, 0, ID_RADIUS_R);
+    PF_ADD_FLOAT_SLIDERX("Amount", 0, 100, 0, 100, 30, PF_Precision_INTEGER, PF_ValueDisplayFlag_PERCENT, 0,
+                         ID_CA_AMOUNT);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_POPUP("Channels", 3, PAIR_RB, "Red / Blue|Red / Green|Green / Blue", ID_CA_CHANNELS);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("Lateral Offset", -200, 200, -50, 50, 0, PF_Precision_TENTHS, 0, 0, ID_CA_OFFSET);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("Red Radius", 0, 4, 0.5, 2, 1, PF_Precision_HUNDREDTHS, 0, 0, ID_RADIUS_R);
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Green Radius", 0, 4, 0.5, 2, 1, PF_Precision_HUNDREDTHS, 0, 0, ID_RADIUS_G);
     AEFX_CLR_STRUCT(def);
-    PF_ADD_FLOAT_SLIDERX("Blue Radius", 0, 4, 0.5, 2, 0.85, PF_Precision_HUNDREDTHS, 0, 0, ID_RADIUS_B);
+    PF_ADD_FLOAT_SLIDERX("Blue Radius", 0, 4, 0.5, 2, 1, PF_Precision_HUNDREDTHS, 0, 0, ID_RADIUS_B);
     ERR(end_group(ID_CHROMA_GROUP_END));
 
     ERR(group("Anamorphic", ID_ANAMORPHIC_GROUP));
@@ -529,7 +612,20 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data) {
     PF_ADD_CHECKBOXX("Enable Anamorphic", FALSE, supervised, ID_ANAMORPHIC_ENABLE);
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Aspect Ratio", 0.1, 10, 0.25, 8, 4, PF_Precision_HUNDREDTHS, 0, 0, ID_ASPECT);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_ANGLE("Angle", 0, ID_ANGLE);
     ERR(end_group(ID_ANAMORPHIC_GROUP_END));
+
+    ERR(group("Input Mask", ID_MASK_GROUP));
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_CHECKBOXX("Enable Mask", FALSE, supervised, ID_MASK_ENABLE);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_LAYER("Mask Layer", PF_LayerDefault_NONE, ID_MASK_LAYER);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_POPUP("Mask Mode", 2, MASK_ALPHA, "Alpha|Luminance", ID_MASK_MODE);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_CHECKBOXX("Invert Mask", FALSE, 0, ID_MASK_INVERT);
+    ERR(end_group(ID_MASK_GROUP_END));
 
     ERR(group("Lens Dirt", ID_DIRT_GROUP));
     AEFX_CLR_STRUCT(def);
@@ -539,6 +635,11 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data) {
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Dirt Amount", 0, 1000, 0, 200, 100, PF_Precision_INTEGER, PF_ValueDisplayFlag_PERCENT, 0,
                          ID_DIRT_AMOUNT);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("Dirt Threshold", 0, 100, 0, 100, 0, PF_Precision_INTEGER, PF_ValueDisplayFlag_PERCENT, 0,
+                         ID_DIRT_THRESHOLD);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_CHECKBOXX("Inherit Glow Color", FALSE, 0, ID_DIRT_INHERIT);
     ERR(end_group(ID_DIRT_GROUP_END));
 
     ERR(group("Depth", ID_DEPTH_GROUP));
@@ -571,11 +672,18 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data) {
     AEFX_CLR_STRUCT(def);
     PF_ADD_CHECKBOXX("Linear Light (Gamma Correct)", TRUE, 0, ID_GAMMA);
     AEFX_CLR_STRUCT(def);
-    PF_ADD_CHECKBOXX("ACES Tonemap", FALSE, 0, ID_TONEMAP);
+    PF_ADD_CHECKBOXX("Tonemap", FALSE, supervised, ID_TONEMAP);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_POPUP("Tonemap Curve", 3, CURVE_ACES, "ACES|Filmic|Reinhard", ID_TONEMAP_CURVE);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("Tonemap Mix", 0, 100, 0, 100, 100, PF_Precision_INTEGER, PF_ValueDisplayFlag_PERCENT, 0,
+                         ID_TONEMAP_MIX);
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Core Size", 0.5, 8, 0.5, 4, 1.5, PF_Precision_HUNDREDTHS, 0, 0, ID_BASE_SIGMA);
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUP("Quality", 4, 1, "Full|High (1/2)|Medium (1/4)|Draft (1/8)", ID_DOWNSAMPLE);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_POPUP("Expand Bounds", 2, EXPAND_AUTO, "Auto|Off (Layer Bounds)", ID_EXPAND);
     ERR(end_group(ID_RENDER_GROUP_END));
 
     out_data->num_params = GP_NUM_PARAMS;
@@ -659,6 +767,8 @@ PF_Err UserChangedParam(PF_ParamDef* params[], const PF_UserChangedParamExtra* e
     set_check(GP_ANAMORPHIC_ENABLE, pr.anamorphic);
     set_float(GP_ASPECT, pr.aspect);
     set_check(GP_CHROMA_ENABLE, pr.chroma);
+    set_float(GP_CA_AMOUNT, 0.0f);  // presets give exact per-channel radii
+    set_float(GP_CA_OFFSET, 0.0f);
     set_float(GP_RADIUS_R, pr.rgb_radius[0]);
     set_float(GP_RADIUS_G, pr.rgb_radius[1]);
     set_float(GP_RADIUS_B, pr.rgb_radius[2]);
@@ -691,10 +801,15 @@ PF_Err UpdateParamsUI(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* par
     enable(GP_TINT_MID, tint == TINT_THREE);
     enable(GP_TINT_HALO, tint != TINT_NONE);
     const bool chroma = params[GP_CHROMA_ENABLE]->u.bd.value != 0;
-    for (int i : {GP_RADIUS_R, GP_RADIUS_G, GP_RADIUS_B}) enable(i, chroma);
-    enable(GP_ASPECT, params[GP_ANAMORPHIC_ENABLE]->u.bd.value != 0);
+    for (int i : {GP_CA_AMOUNT, GP_CA_CHANNELS, GP_CA_OFFSET, GP_RADIUS_R, GP_RADIUS_G, GP_RADIUS_B}) enable(i, chroma);
+    const bool anamorphic = params[GP_ANAMORPHIC_ENABLE]->u.bd.value != 0;
+    for (int i : {GP_ASPECT, GP_ANGLE}) enable(i, anamorphic);
+    const bool mask = params[GP_MASK_ENABLE]->u.bd.value != 0;
+    for (int i : {GP_MASK_LAYER, GP_MASK_MODE, GP_MASK_INVERT}) enable(i, mask);
+    const bool tonemap = params[GP_TONEMAP]->u.bd.value != 0;
+    for (int i : {GP_TONEMAP_CURVE, GP_TONEMAP_MIX}) enable(i, tonemap);
     const bool dirt = params[GP_DIRT_ENABLE]->u.bd.value != 0;
-    for (int i : {GP_DIRT_LAYER, GP_DIRT_AMOUNT}) enable(i, dirt);
+    for (int i : {GP_DIRT_LAYER, GP_DIRT_AMOUNT, GP_DIRT_THRESHOLD, GP_DIRT_INHERIT}) enable(i, dirt);
     const bool depth = params[GP_DEPTH_ENABLE]->u.bd.value != 0;
     for (int i : {GP_DEPTH_LAYER, GP_DEPTH_SPREAD, GP_OCCLUSION, GP_DEPTH_INVERT}) enable(i, depth);
     enable(GP_TEMPORAL, params[GP_FLICKER_ENABLE]->u.bd.value != 0);
@@ -704,10 +819,12 @@ PF_Err UpdateParamsUI(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* par
 PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* extra) {
     PF_Err err = PF_Err_NONE;
     GlowParams p;
-    ERR(ReadParams(in_data, out_data, p));
+    HostOptions host;
+    ERR(ReadParams(in_data, out_data, p, &host));
     if (err) return err;
 
-    const A_long pad = GlowPadding(p);
+    // Expand Bounds off: the glow stays inside the layer's own bounds.
+    const A_long pad = host.expand ? GlowPadding(p) : 0;
 
     // Any input pixel within `pad` of the requested area can light it up.
     PF_RenderRequest req = extra->input->output_request;
@@ -726,8 +843,8 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
     if (!plan) return PF_Err_OUT_OF_MEMORY;
     plan->input_rect = in_result.result_rect;
     plan->output_rect = extra->output->result_rect;
-    plan->prev_rect = plan->next_rect = plan->dirt_rect = plan->depth_rect = PF_LRect{0, 0, 0, 0};
-    plan->dirt = plan->depth = false;
+    plan->prev_rect = plan->next_rect = plan->dirt_rect = plan->depth_rect = plan->mask_rect = PF_LRect{0, 0, 0, 0};
+    plan->dirt = plan->depth = plan->mask = false;
     plan->layer_width = A_long(std::lround(double(in_data->width) * in_data->downsample_x.num /
                                            std::max<A_long>(in_data->downsample_x.den, 1)));
     plan->layer_height = A_long(std::lround(double(in_data->height) * in_data->downsample_y.num /
@@ -765,14 +882,18 @@ PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* ex
     if (!err && glows && (p.depth_spread > 0.0f || p.occlusion)) {
         checkout_whole(GP_DEPTH_LAYER, CHECKOUT_DEPTH, plan->depth, plan->depth_rect);
     }
+    if (!err && glows && host.mask) checkout_whole(GP_MASK_LAYER, CHECKOUT_MASK, plan->mask, plan->mask_rect);
     if (err) {
         delete plan;
         return err;
     }
     // The GPU path covers everything but the extra inputs (depth, lens
-    // dirt, neighbouring frames); with those, AE renders on the CPU.
-    const bool extra_inputs = plan->dirt || plan->depth || !IsEmpty(plan->prev_rect) || !IsEmpty(plan->next_rect);
-    if (!extra_inputs) extra->output->flags |= PF_RenderOutputFlag_GPU_RENDER_POSSIBLE;
+    // dirt, mask, neighbouring frames), the turned anamorphic and the lateral
+    // chromatic aberration; with those, AE renders on the CPU.
+    const bool extra_inputs = plan->dirt || plan->depth || plan->mask || !IsEmpty(plan->prev_rect) ||
+                              !IsEmpty(plan->next_rect);
+    const bool cpu_only = p.ca_offset != 0.0f || (p.aspect != 1.0f && std::fmod(p.angle, 180.0f) != 0.0f);
+    if (!extra_inputs && !cpu_only) extra->output->flags |= PF_RenderOutputFlag_GPU_RENDER_POSSIBLE;
     extra->output->pre_render_data = plan;
     extra->output->delete_pre_render_data_func = DeleteRenderPlan;
     return err;
@@ -784,8 +905,8 @@ PF_Err SmartRender(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra
     if (!plan) return PF_Err_BAD_CALLBACK_PARAM;
 
     GlowParams p;
-    bool invert_depth = false;
-    ERR(ReadParams(in_data, out_data, p, &invert_depth));
+    HostOptions host;
+    ERR(ReadParams(in_data, out_data, p, &host));
 
     PF_EffectWorld* input = nullptr;
     PF_EffectWorld* output = nullptr;
@@ -845,6 +966,36 @@ PF_Err SmartRender(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra
                 }
                 if (w) ERR2(extra->cb->checkin_layer_pixels(in_data->effect_ref, CHECKOUT_PREV + i));
             }
+            // Lateral chromatic aberration about the layer's centre, full
+            // offset at its corners.
+            p.ca_center_x = float(plan->layer_width) * 0.5f - float(bounds.left);
+            p.ca_center_y = float(plan->layer_height) * 0.5f - float(bounds.top);
+            p.ca_rmax = 0.5f * std::hypot(float(plan->layer_width), float(plan->layer_height));
+            Image mask;
+            if (!err && plan->mask) {
+                PF_EffectWorld* w = nullptr;
+                ERR(extra->cb->checkout_layer_pixels(in_data->effect_ref, CHECKOUT_MASK, &w));
+                if (!err && w && w->data) {
+                    Image tex(int(w->width), int(w->height), 4);
+                    ERR(ReadWorld(format, w, tex, 0, 0));
+                    if (!err) {
+                        // Alpha, or luminance over black (premultiplied), then invert.
+                        for (size_t i = 0; i < tex.data.size(); i += 4) {
+                            float v = host.mask_luma ? 0.2126f * tex.data[i] + 0.7152f * tex.data[i + 1] +
+                                                           0.0722f * tex.data[i + 2]
+                                                     : tex.data[i + 3];
+                            v = std::clamp(v, 0.0f, 1.0f);
+                            if (host.mask_invert) v = 1.0f - v;
+                            tex.data[i] = tex.data[i + 1] = tex.data[i + 2] = v;
+                            tex.data[i + 3] = 1.0f;
+                        }
+                        mask = ResampleLayer(tex, plan->layer_width, plan->layer_height, bounds.left, bounds.top,
+                                             src.width, src.height);
+                        inputs.mask = &mask;
+                    }
+                }
+                if (w) ERR2(extra->cb->checkin_layer_pixels(in_data->effect_ref, CHECKOUT_MASK));
+            }
             if (!plan->depth) {
                 // No depth layer: the depth controls do nothing.
                 p.depth_spread = 0.0f;
@@ -864,7 +1015,7 @@ PF_Err SmartRender(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra
                         for (size_t i = 0; i < tex.data.size(); i += 4) {
                             const float a = tex.data[i + 3];
                             float z = a > 0.0f ? tex.data[i] / a : 1.0f;
-                            if (invert_depth && a > 0.0f) z = 1.0f - z;
+                            if (host.invert_depth && a > 0.0f) z = 1.0f - z;
                             tex.data[i] = tex.data[i + 1] = tex.data[i + 2] = z;
                             tex.data[i + 3] = 1.0f;
                         }

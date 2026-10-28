@@ -51,13 +51,19 @@ ignorés tant que la case est décochée).
 | Saturation | `saturation` (%, 100 = inchangé, 0 = gris) |
 | Blend Mode | `blend` : Add ou Screen |
 | View | `view` : Final, Glow Only, Source, Glow Behind |
+| Source Opacity | `source_opacity` (%) : part de la source dans le composite (le glow reste calculé sur la source entière) |
 | Color Tint › Tint, Core / Middle / Halo Color | `tint` (Off, 2 ou 3 couleurs) |
-| Chromatic Aberration › Enable, Red / Green / Blue Radius | `rgb_radius` (1, 1, 1 si décoché) |
-| Anamorphic › Enable, Aspect Ratio | `aspect` (1 si décoché) |
-| Lens Dirt › Enable, Dirt Texture, Dirt Amount | `GlowInputs::dirt` (calque étiré sur le calque de l'effet), `dirt_amount` (%) |
+| Chromatic Aberration › Enable, Amount, Channels, Lateral Offset, Red / Green / Blue Radius | `rgb_radius` = rayons fins × Amount (la paire choisie s'écarte : 1re × (1 + a), 2e × (1 − a), a = Amount / 200) ; `ca_offset` (px, aux coins du calque), `ca_pair`, centre = milieu du calque. Rayons 1, 1, 1 et pas de décalage si décoché |
+| Anamorphic › Enable, Aspect Ratio, Angle | `aspect`, `angle` (le glow est calculé dans un buffer tourné) ; 1 et 0 si décoché |
+| Input Mask › Enable, Mask Layer, Mask Mode, Invert | `GlowInputs::mask` : alpha ou luminance du calque (étiré sur le calque), inversé au besoin ; ne masque que la source du glow |
+| Lens Dirt › Enable, Dirt Texture, Dirt Amount, Dirt Threshold, Inherit Glow Color | `GlowInputs::dirt` (calque étiré sur le calque de l'effet), `dirt_amount` (%), `dirt_threshold` (%), `dirt_inherit_color` |
 | Depth › Enable, Depth Layer, Depth Spread, Occlusion, Invert Depth | `GlowInputs::depth` (rouge, 0 = proche ; zones transparentes = loin), `depth_spread`, `occlusion` ; Invert = `1 − rouge`. Ignoré sans calque |
 | Anti-Flicker › Enable, Smoothing | `temporal_smooth` (%) : mélange les images t ± 1 dans la source du glow |
-| Advanced › Threshold Smoothness, Unmultiply, Linear Light, ACES Tonemap, Core Size, Quality | `threshold_smooth`, `unmult`, `gamma_correct`, `tonemap`, `base_sigma`, `downsample` |
+| Advanced › Threshold Smoothness, Unmultiply, Linear Light | `threshold_smooth`, `unmult`, `gamma_correct` |
+| Advanced › Tonemap, Tonemap Curve, Tonemap Mix | `tonemap`, `tonemap_curve` (ACES, Filmic = Hable, Reinhard), `tonemap_mix` (%). L'ancienne case « ACES Tonemap » garde son identifiant : cochée = ACES |
+| Advanced › Core Size | `base_sigma`, avec `base_sigma_ref` = 1,5 px : agrandir le cœur ramène la lumière des octaves plus fines dans le cœur (le glow ne rapetisse plus) |
+| Advanced › Quality | `downsample` : Full, 1/2, 1/4, 1/8 ; même look, seuls les détails fins se perdent |
+| Advanced › Expand Bounds | Auto (le glow déborde du calque, 4 × rayon) ou Off (limité aux bords du calque) |
 
 Les valeurs par défaut reproduisent le glow par défaut de Deep Glow autour
 d'une forme blanche (comparaison de rendus, voir
@@ -80,6 +86,9 @@ l'aperçu : un aperçu en demi-résolution garde le même look.
   `render()` (testé).
 - Le buffer de sortie est agrandi de 3 × rayon autour du calque
   (`PF_OutFlag_I_EXPAND_BUFFER`), limité à la zone demandée par AE.
+- Sur GPU : tout sauf profondeur, saleté, masque, anti-scintillement,
+  anamorphique tourné et décalage latéral de l'aberration (AE repasse alors
+  sur le CPU, automatiquement).
 - Rendu GPU Metal (Mac) quand l'accélération GPU d'After Effects est active
   (Paramètres du projet › Rendu vidéo et effets › Accélération GPU Mercury
   (Metal)) : les images restent sur le GPU, le pipeline complet
