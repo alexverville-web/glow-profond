@@ -41,8 +41,16 @@ suit est notre choix de conception.
    facteur = `max(soft, br - t) / br`.
 3. Pyramide : niveau k à résolution 1/2^k, flou gaussien de σ_k = σ₀·2^k
    (donc σ constant en pixels du niveau : coût quasi indépendant du rayon).
-   Nombre de niveaux : `floor(log2(radius / σ₀)) + 1`.
-4. Poids w_k ∝ σ_k^(2−p), normalisés. Une somme de gaussiennes 2D normalisées
+   Tailles impaires arrondies au-dessus avec des zéros au-delà du bord, et
+   remontée tente à l'échelle exacte 2 : le texel i du niveau k couvre
+   toujours les pixels [2^k·i, 2^k·(i+1)), donc le halo reste centré quelle
+   que soit la taille du buffer (l'hôte doit aligner l'origine du buffer sur
+   un multiple de 2^(n−1) pour qu'il ne bouge pas du tout).
+   Octaves continues : n_f = log2(radius / σ₀) + 1, n = ceil(n_f) niveaux ;
+   le plus large a σ = radius exactement et son poids est multiplié par
+   n_f − (n − 1), pour que le halo grandisse sans saut quand le rayon monte.
+4. Poids w_k = (σ_k / σ₀)^(2−p), **non normalisés** : monter le rayon ajoute
+   du halo plus loin sans assombrir celui qui est près de la source. Une somme de gaussiennes 2D normalisées
    à σ espacés en log, pondérées ainsi, donne une PSF ∝ r^−p entre σ₀ et le
    rayon max. **p = 2 → poids égaux par octave → falloff en 1/r².**
    p < 2 élargit le halo, p > 2 le resserre.
