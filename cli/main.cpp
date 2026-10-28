@@ -127,6 +127,10 @@ int usage() {
                  "  --occlusion           nearer pixels mask the glow of farther ones\n"
                  "  --occlusion-softness F  depth range of the occlusion edge (0.05)\n"
                  "  --saturation F        glow saturation, 1 = as is (1)\n"
+                 "  --base-sigma-ref F    core size reference sigma (0 = off)\n"
+                 "  --angle DEG           anamorphic direction (0)\n"
+                 "  --ca-offset F --ca-center X,Y --ca-rmax F --ca-pair rb|rg|gb  lateral chromatic aberration\n"
+                 "  --tonemap-curve aces|hable|reinhard  --tonemap-mix F  --source-opacity F\n"
                  "  --view final|glow|source|behind\n"
                  "  --unmult  --tonemap  --linear (disable gamma correction)\n"
                  "  --bench N             time N renders and print the average\n";
@@ -155,6 +159,26 @@ int main(int argc, char** argv) {
         else if (a == "--rgb-radius" && has_value) p.rgb_radius = parse_rgb(next());
         else if (a == "--base-sigma" && has_value) p.base_sigma = std::strtof(next(), nullptr);
         else if (a == "--saturation" && has_value) p.saturation = std::strtof(next(), nullptr);
+        else if (a == "--base-sigma-ref" && has_value) p.base_sigma_ref = std::strtof(next(), nullptr);
+        else if (a == "--angle" && has_value) p.angle = std::strtof(next(), nullptr);
+        else if (a == "--ca-offset" && has_value) p.ca_offset = std::strtof(next(), nullptr);
+        else if (a == "--ca-rmax" && has_value) p.ca_rmax = std::strtof(next(), nullptr);
+        else if (a == "--ca-center" && has_value) {
+            const glow_profond::Rgb v = parse_rgb(next());
+            p.ca_center_x = v[0];
+            p.ca_center_y = v[1];
+        } else if (a == "--ca-pair" && has_value) {
+            const std::string v = next();
+            p.ca_pair = v == "rg" ? glow_profond::ChannelPair::RG
+                      : v == "gb" ? glow_profond::ChannelPair::GB
+                                  : glow_profond::ChannelPair::RB;
+        } else if (a == "--tonemap-curve" && has_value) {
+            const std::string v = next();
+            p.tonemap_curve = v == "hable" ? glow_profond::Tonemap::Hable
+                            : v == "reinhard" ? glow_profond::Tonemap::Reinhard
+                                              : glow_profond::Tonemap::Aces;
+        } else if (a == "--tonemap-mix" && has_value) p.tonemap_mix = std::strtof(next(), nullptr);
+        else if (a == "--source-opacity" && has_value) p.source_opacity = std::strtof(next(), nullptr);
         else if (a == "--downsample" && has_value) p.downsample = std::atoi(next());
         else if (a == "--tint" && has_value) {
             if (!tint_set) p.tint.clear();

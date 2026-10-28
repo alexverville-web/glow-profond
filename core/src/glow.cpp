@@ -114,6 +114,28 @@ float aces_fitted(float x) {
     return std::clamp(x * (a * x + b) / (x * (c * x + d) + e), 0.0f, 1.0f);
 }
 
+namespace {
+float hable(float x) {
+    const float a = 0.15f, b = 0.5f, c = 0.1f, d = 0.2f, e = 0.02f, f = 0.3f;
+    return (x * (a * x + c * b) + d * e) / (x * (a * x + b) + d * f) - e / f;
+}
+}  // namespace
+
+float apply_tonemap(float x, const GlowParams& p) {
+    if (!p.tonemap) return x;
+    float t;
+    switch (p.tonemap_curve) {
+        case Tonemap::Hable: t = hable(2.0f * std::max(x, 0.0f)) / hable(11.2f); break;
+        case Tonemap::Reinhard: {
+            const float x0 = std::max(x, 0.0f);
+            t = x0 / (1.0f + x0);
+            break;
+        }
+        default: t = aces_fitted(x); break;
+    }
+    return x + (t - x) * p.tonemap_mix;
+}
+
 Image soft_threshold(const Image& rgb, float t, float smooth) {
     Image out = rgb;
     // Knee relative to the threshold: t = 0 passes the image through unchanged.
@@ -412,6 +434,12 @@ LevelPlan level_plan(const GlowParams& p) {
     // the radius and whose weight fades in with the fractional octave: the
     // halo grows smoothly with the radius instead of jumping a level at a time.
     // Weights are not normalized, so a larger radius only adds halo further out.
+    // Core size: weights relative to base_sigma_ref when set; the octaves
+    // between it and a larger base_sigma add their (integrated, so
+    // continuous) weight to the first level instead of being dropped, so a
+    // bigger core softens the core and keeps the glow (it used to shrink).
+    const double ref = p.base_sigma_ref > 0.0f ? double(p.base_sigma_ref) : double(p.base_sigma);
+    const double q = 2.0 - double(p.spread);
     const double nf = std::log2(std::max(double(p.radius) / double(p.base_sigma), 1.0)) + 1.0;
     const int n = std::max(1, int(std::ceil(nf - 1e-6)));
     LevelPlan plan;
@@ -419,8 +447,12 @@ LevelPlan level_plan(const GlowParams& p) {
     plan.weights.resize(static_cast<size_t>(n));
     for (int k = 0; k < n; ++k) {
         const double sigma = double(p.base_sigma) * std::pow(2.0, k == n - 1 ? nf - 1.0 : double(k));
-        double w = std::pow(sigma / double(p.base_sigma), 2.0 - double(p.spread));
+        double w = std::pow(sigma / ref, q);
         if (k == n - 1) w *= std::min(nf - double(n - 1), 1.0);
+        if (k == 0 && double(p.base_sigma) > ref) {
+            const double span = std::log2(double(p.base_sigma) / ref);
+            w += std::fabs(q) < 1e-9 ? span : (std::pow(2.0, q * span) - 1.0) / (q * std::log(2.0));
+        }
         plan.sigmas[size_t(k)] = float(sigma);
         plan.weights[size_t(k)] = float(w);
     }
@@ -458,7 +490,15 @@ Image depth_map(const Image& img, int W, int H) {
 
 }  // namespace
 
-Image glow_layer(const Image& src, const GlowParams& p, const Image* depth, const Image* dirt) {
+namespace {
+
+// The glow before lateral chromatic aberration and saturation (glow_layer).
+// Level k is blurred at 1 / max(2^k, D) resolution (D = global downsample,
+// the Quality setting) and levels are folded back with a 2x tent upsample
+// wherever the resolution changes, so a lower Quality keeps the same look and
+// only loses the finest detail. (All levels 2^e times coarser made each one
+// ~2^e times too wide: the glow went dim and washed out.)
+Image glow_core(const Image& src, const GlowParams& p, const Image* depth, const Image* dirt) {
     const int H = src.height, W = src.width;
     Image thr = soft_threshold(src, p.threshold, p.threshold_smooth);
     Image d;
@@ -471,7 +511,6 @@ Image glow_layer(const Image& src, const GlowParams& p, const Image* depth, cons
 
     if (thr.width == 0 || thr.height == 0) return Image(W, H, 3);
 
-    const float scale = float(1 << extra);
     const LevelPlan plan = level_plan(p);
     const std::vector<float>& weights = plan.weights;
     const int n = int(weights.size());
@@ -529,11 +568,16 @@ Image glow_layer(const Image& src, const GlowParams& p, const Image* depth, cons
         pyr_a.push_back(std::move(a));
         if (spread > 0.0f) pyr_b.push_back(std::move(b));
     }
+    // Level k lives at 1 / 2^res[k]; levels finer than the Quality
+    // resolution share its image.
+    std::vector<int> res(static_cast<size_t>(n));
+    for (int k = 0; k < n; ++k) res[size_t(k)] = std::max(k, extra);
     for (int k = 1; k < n; ++k) {
-        Image next = downsample2(pyr_a.back());
+        const bool same = res[size_t(k)] == res[size_t(k - 1)];
+        Image next = same ? pyr_a.back() : downsample2(pyr_a.back());
         if (next.width == 0 || next.height == 0) break;  // tiny images: fewer levels
         pyr_a.push_back(std::move(next));
-        if (!pyr_b.empty()) pyr_b.push_back(downsample2(pyr_b.back()));
+        if (!pyr_b.empty()) pyr_b.push_back(same ? pyr_b.back() : downsample2(pyr_b.back()));
     }
     const int used = int(pyr_a.size());
 
@@ -554,11 +598,13 @@ Image glow_layer(const Image& src, const GlowParams& p, const Image* depth, cons
             const Image& b = pyr_b[size_t(k)];
             for (size_t i = 0; i < lvl.data.size(); ++i) lvl.data[i] += c[k] * b.data[i];
         }
-        const float var = kTentStepVariance * (4.0f / 3.0f) * (1.0f - std::pow(4.0f, -float(k)));
+        // Variance of the upsample steps from this level down to the base.
+        const int steps = res[size_t(k)] - extra;
+        const float var = kTentStepVariance * (4.0f / 3.0f) * (1.0f - std::pow(4.0f, -float(steps)));
         std::vector<float> sx(static_cast<size_t>(pc)), sy(static_cast<size_t>(pc));
         for (int ch = 0; ch < pc; ++ch) {
-            // Sigma in level k's own pixels: base_sigma for all but the widest.
-            const float sigma_level = plan.sigmas[size_t(k)] / (std::pow(2.0f, float(k)) * scale);
+            // Sigma in level k's own pixels.
+            const float sigma_level = plan.sigmas[size_t(k)] / std::pow(2.0f, float(res[size_t(k)]));
             const float s = sigma_level * (ch < 3 ? p.rgb_radius[ch] : 1.0f);
             sx[ch] = std::sqrt(std::max((s * ax) * (s * ax) - var, 0.0f));
             sy[ch] = std::sqrt(std::max((s * ay) * (s * ay) - var, 0.0f));
@@ -569,6 +615,9 @@ Image glow_layer(const Image& src, const GlowParams& p, const Image* depth, cons
         Rgb gain;
         for (int ch = 0; ch < 3; ++ch) gain[ch] = w * tint[ch];
         const float large = k >= large_from ? w : 0.0f;
+        // Lens dirt lit by the untinted wide glow, or the tinted one.
+        const Rgb dirt_gain = p.dirt_inherit_color ? Rgb{large * tint[0], large * tint[1], large * tint[2]}
+                                                   : Rgb{large, large, large};
         Image out = ac == pc ? std::move(lvl) : Image(lvl.width, lvl.height, ac);
         const Image& in = ac == pc ? out : lvl;
         if (ac == 3) {  // plain glow, in place
@@ -587,7 +636,7 @@ Image glow_layer(const Image& src, const GlowParams& p, const Image* depth, cons
                 const float occ[2] = {occlude ? v[3] : 0.0f, occlude ? v[4] : 0.0f};
                 for (int ch = 0; ch < 3; ++ch) o[ch] = gain[ch] * rgb[ch];
                 if (want_dirt)
-                    for (int ch = 0; ch < 3; ++ch) o[large_off + ch] = large * rgb[ch];
+                    for (int ch = 0; ch < 3; ++ch) o[large_off + ch] = dirt_gain[ch] * rgb[ch];
                 if (occlude) {
                     o[occ_off] = w * occ[0];
                     o[occ_off + 1] = w * occ[1];
@@ -600,13 +649,14 @@ Image glow_layer(const Image& src, const GlowParams& p, const Image* depth, cons
     Image acc = contribution(used - 1);
     for (int k = used - 2; k >= 0; --k) {
         const Image lvl = contribution(k);
-        acc = upsample_tent2_add(acc, lvl.width, lvl.height, &lvl);
+        if (res[size_t(k + 1)] != res[size_t(k)]) {
+            acc = upsample_tent2_add(acc, lvl.width, lvl.height, &lvl);
+        } else {
+            for (size_t i = 0; i < acc.data.size(); ++i) acc.data[i] += lvl.data[i];
+        }
     }
     if (acc.width != W || acc.height != H) acc = upsample_by(acc, W, H, 1 << extra);
-    if (ac == 3) {
-        saturate(acc, p.saturation);
-        return acc;
-    }
+    if (ac == 3) return acc;
 
     Image d_full, dirt_full;
     if (occlude) d_full = depth_map(*depth, W, H);
@@ -627,12 +677,113 @@ Image glow_layer(const Image& src, const GlowParams& p, const Image* depth, cons
             for (int ch = 0; ch < 3; ++ch) g[ch] = a[ch] * keep;
             if (dirt_img) {
                 const float* dt = dirt_img->px(x, y);
-                for (int ch = 0; ch < 3; ++ch) g[ch] += p.dirt_amount * dt[ch] * a[large_off + ch];
+                const float t = p.dirt_threshold;
+                for (int ch = 0; ch < 3; ++ch) {
+                    // Threshold: a matte, only the brighter smudges light up.
+                    const float v = t > 0.0f ? std::max(dt[ch] - t, 0.0f) / std::max(1.0f - t, 1e-6f) : dt[ch];
+                    g[ch] += p.dirt_amount * v * a[large_off + ch];
+                }
             }
         }
     });
-    saturate(glow, p.saturation);
     return glow;
+}
+
+// Bilinear read of channel ch at pixel-centre coordinates, zero outside
+// (same arithmetic as the reference _sample).
+float sample(const Image& img, int ch, double xs, double ys) {
+    const double x = xs - 0.5, y = ys - 0.5;
+    const int x0 = int(std::floor(x)), y0 = int(std::floor(y));
+    const float fx = float(x - x0), fy = float(y - y0);
+    auto at = [&](int yy, int xx) {
+        return (xx >= 0 && xx < img.width && yy >= 0 && yy < img.height) ? img.px(xx, yy)[ch] : 0.0f;
+    };
+    const float top = at(y0, x0) * (1.0f - fx) + at(y0, x0 + 1) * fx;
+    const float bot = at(y0 + 1, x0) * (1.0f - fx) + at(y0 + 1, x0 + 1) * fx;
+    return top * (1.0f - fy) + bot * fy;
+}
+
+// Buffer turned so the angle lies along x: size, and the unit vectors along
+// (d) and across (n) the angle in image coordinates (y down).
+struct Rotation {
+    int w, h;
+    double dx, dy, nx, ny;
+};
+
+Rotation rotation(float angle, int w, int h) {
+    const double t = double(angle) * 3.14159265358979323846 / 180.0, c = std::cos(t), s = std::sin(t);
+    return {int(std::ceil(std::fabs(w * c) + std::fabs(h * s))) + 2,
+            int(std::ceil(std::fabs(w * s) + std::fabs(h * c))) + 2, c, -s, s, c};
+}
+
+Image rotate_in(const Image& img, const Rotation& r) {
+    Image out(r.w, r.h, img.channels);
+    parallel_rows(r.h, [&](int v) {
+        for (int u = 0; u < r.w; ++u) {
+            const double qx = u + 0.5 - r.w / 2.0, qy = v + 0.5 - r.h / 2.0;
+            const double xs = img.width / 2.0 + qx * r.dx + qy * r.nx;
+            const double ys = img.height / 2.0 + qx * r.dy + qy * r.ny;
+            for (int ch = 0; ch < img.channels; ++ch) out.px(u, v)[ch] = sample(img, ch, xs, ys);
+        }
+    });
+    return out;
+}
+
+Image rotate_out(const Image& img, int w, int h, const Rotation& r) {
+    Image out(w, h, img.channels);
+    parallel_rows(h, [&](int y) {
+        for (int x = 0; x < w; ++x) {
+            const double rx = x + 0.5 - w / 2.0, ry = y + 0.5 - h / 2.0;
+            const double xs = img.width / 2.0 + rx * r.dx + ry * r.dy;
+            const double ys = img.height / 2.0 + rx * r.nx + ry * r.ny;
+            for (int ch = 0; ch < img.channels; ++ch) out.px(x, y)[ch] = sample(img, ch, xs, ys);
+        }
+    });
+    return out;
+}
+
+// Lateral chromatic aberration: the channel pair scaled apart about the
+// centre by (1 + k) and (1 - k), k = ca_offset / ca_rmax.
+void lateral_ca(Image& g, const GlowParams& p) {
+    if (p.ca_offset == 0.0f) return;
+    const int a = p.ca_pair == ChannelPair::GB ? 1 : 0;
+    const int b = p.ca_pair == ChannelPair::RG ? 1 : 2;
+    const float k = std::clamp(p.ca_offset / std::max(p.ca_rmax, 1e-6f), -0.9f, 0.9f);
+    const Image src = g;
+    const double cx = p.ca_center_x, cy = p.ca_center_y, sa = 1.0 + k, sb = 1.0 - k;
+    parallel_rows(g.height, [&](int y) {
+        for (int x = 0; x < g.width; ++x) {
+            const double px = x + 0.5, py = y + 0.5;
+            g.px(x, y)[a] = sample(src, a, cx + (px - cx) / sa, cy + (py - cy) / sa);
+            g.px(x, y)[b] = sample(src, b, cx + (px - cx) / sb, cy + (py - cy) / sb);
+        }
+    });
+}
+
+}  // namespace
+
+Image glow_layer(const Image& src, const GlowParams& p, const Image* depth, const Image* dirt) {
+    // With an aspect ratio and an angle, the glow is computed in a buffer
+    // turned so the angle lies along x, then turned back. Lateral chromatic
+    // aberration, then saturation, apply to the finished glow.
+    GlowParams q = p;
+    q.saturation = 1.0f;
+    q.ca_offset = 0.0f;
+    q.angle = 0.0f;
+    Image g;
+    if (p.aspect != 1.0f && std::fmod(p.angle, 180.0f) != 0.0f) {
+        const int w = src.width, h = src.height;
+        const Rotation r = rotation(p.angle, w, h);
+        Image rdepth, rdirt;
+        if (depth) rdepth = rotate_in(depth_map(*depth, w, h), r);
+        if (dirt) rdirt = rotate_in((dirt->width == w && dirt->height == h) ? *dirt : upsample_to(*dirt, w, h), r);
+        g = rotate_out(glow_core(rotate_in(src, r), q, depth ? &rdepth : nullptr, dirt ? &rdirt : nullptr), w, h, r);
+    } else {
+        g = glow_core(src, q, depth, dirt);
+    }
+    lateral_ca(g, p);
+    saturate(g, p.saturation);
+    return g;
 }
 
 namespace {
@@ -663,7 +814,13 @@ Image render(const Image& src, const GlowParams& p, const Image* depth, const Im
         }
     });
 
+    // Source opacity: the source's share of the composite (the glow is still
+    // made from the full source).
     Image out = lin;
+    if (p.source_opacity != 1.0f) {
+        for (float& v : out.data) v *= p.source_opacity;
+        for (float& c : coverage) c *= p.source_opacity;
+    }
     if (p.view != View::Source) {
         Image dirt_lin;
         if (dirt && p.dirt_amount > 0.0f) {
@@ -689,7 +846,7 @@ Image render(const Image& src, const GlowParams& p, const Image* depth, const Im
     parallel_rows(H, [&](int y) {
         float* row = out.px(0, y);
         for (int i = 0; i < W * 3; ++i) {
-            if (p.tonemap) row[i] = aces_fitted(row[i]);
+            row[i] = apply_tonemap(row[i], p);
             if (p.gamma_correct) row[i] = linear_to_srgb(row[i]);
         }
     });
@@ -769,22 +926,39 @@ Image render_premultiplied(const Image& src, const GlowParams& p, const GlowInpu
                     depth.px(x, y)[0] = d.channels == 4 ? (a > 0.0f ? s[0] / a : 1.0f) : s[0];
                 }
         }
+        // Input mask: only the glow source is masked, never the composited layer.
+        Image masked;
+        if (inputs.mask) {
+            masked = *glow_src;
+            const Image& m = *inputs.mask;
+            parallel_rows(H, [&](int y) {
+                for (int x = 0; x < W; ++x) {
+                    const float v = std::clamp(m.px(x, y)[0], 0.0f, 1.0f);
+                    float* o = masked.px(x, y);
+                    for (int c = 0; c < 3; ++c) o[c] *= v;
+                }
+            });
+            glow_src = &masked;
+        }
         glow = glow_layer(*glow_src, p, inputs.depth ? &depth : nullptr,
                           dirt_lin.data.empty() ? nullptr : &dirt_lin);
     }
 
     // Linear light -> output encoding (tonemap, then sRGB when gamma_correct).
     auto encode = [&](float v) {
-        if (p.tonemap) v = aces_fitted(v);
+        v = apply_tonemap(v, p);
         if (p.gamma_correct) v = linear_to_srgb(v);
         return v;
     };
     Image out(W, H, 4);
     parallel_rows(H, [&](int y) {
         for (int x = 0; x < W; ++x) {
-            const float* l = lin.px(x, y);
+            // Source opacity scales the source in the composite only.
+            const float op = p.source_opacity;
+            const float* lp = lin.px(x, y);
+            const float l[3] = {lp[0] * op, lp[1] * op, lp[2] * op};
             float* o = out.px(x, y);
-            const float a = alpha[size_t(y) * W + x];
+            const float a = alpha[size_t(y) * W + x] * op;
             // The source keeps its usual encoding: straight colour encoded,
             // premultiplied again. Semi-transparent edges are unchanged.
             float src_enc[3];

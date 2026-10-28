@@ -287,6 +287,9 @@ PF_Err ReadParams(PF_InData* in_data, PF_OutData* out_data, GlowParams& p, bool*
         auto on = [&](int index) { return defs[index].u.bd.value != 0; };
         p.radius = ToFloat(defs[GP_RADIUS]) * scale;
         p.base_sigma = ToFloat(defs[GP_BASE_SIGMA]) * scale;
+        // Core Size is relative to its default (1.5 px): a bigger core folds
+        // the finer octaves' light into the core instead of dropping it.
+        p.base_sigma_ref = 1.5f * scale;
         p.exposure = ToFloat(defs[GP_EXPOSURE]) + kExposureCalibration;
         p.spread = SpreadToExponent(ToFloat(defs[GP_SPREAD_AMOUNT]));
         p.threshold = ToFloat(defs[GP_THRESHOLD]);

@@ -23,6 +23,12 @@ enum class View { Final, Glow, Source, Behind };
 // on channels at or below 1, so whites blow out much less).
 enum class Blend { Add, Screen };
 
+// Tonemap curve used when GlowParams::tonemap is on.
+enum class Tonemap { Aces, Hable, Reinhard };
+
+// Channel pair the lateral chromatic aberration pulls apart.
+enum class ChannelPair { RB, RG, GB };
+
 struct GlowParams {
     float radius = 400.0f;           // largest blur sigma, in pixels
     float exposure = 0.0f;           // stops applied to the glow
@@ -45,6 +51,23 @@ struct GlowParams {
     float occlusion_softness = 0.05f;  // depth range of the occlusion smoothstep
     float temporal_smooth = 0.0f;    // 0..1, blends neighbouring frames into the glow source
     float saturation = 1.0f;         // glow saturation around its Rec. 709 luma: 0 grey, 1 as is, 2 double
+    // Core size: with base_sigma_ref > 0, level weights are relative to that
+    // sigma and the light of the octaves between it and a larger base_sigma
+    // folds into the first level, so a bigger core keeps the glow's energy.
+    float base_sigma_ref = 0.0f;
+    float angle = 0.0f;              // degrees: direction of the aspect stretch (0 = horizontal)
+    // Lateral chromatic aberration on the glow: the channel pair is scaled
+    // apart about (ca_center_x, ca_center_y) (pixel-centre coordinates); the
+    // first channel moves out by ca_offset px at distance ca_rmax, the second in.
+    float ca_offset = 0.0f;
+    float ca_center_x = 0.0f, ca_center_y = 0.0f;
+    float ca_rmax = 1.0f;
+    ChannelPair ca_pair = ChannelPair::RB;
+    Tonemap tonemap_curve = Tonemap::Aces;
+    float tonemap_mix = 1.0f;        // 0 = untouched, 1 = full curve
+    float source_opacity = 1.0f;     // the source in the composite (the glow is unaffected)
+    bool dirt_inherit_color = false; // lens dirt lit by the tinted glow instead of the untinted one
+    float dirt_threshold = 0.0f;     // cuts the dirt texture's dark values (0..1)
 };
 
 // Planar-free, interleaved image with a fixed channel count.
@@ -94,6 +117,7 @@ Image render(const Image& src, const GlowParams& p, const Image* depth = nullptr
 //   the glow source by p.temporal_smooth to calm flickering highlights. The
 //   source itself is still composited from the current frame only.
 struct GlowInputs {
+    const Image* mask = nullptr;     // glow source mask, first channel 0..1 (only the glow source is masked)
     const Image* depth = nullptr;
     const Image* dirt = nullptr;
     std::vector<const Image*> neighbors;
@@ -114,5 +138,7 @@ void blur_axis(Image& img, int channel, float sigma, bool vertical);
 float srgb_to_linear(float x);
 float linear_to_srgb(float x);
 float aces_fitted(float x);
+// p's tonemap (curve and mix) on a linear value; identity when off.
+float apply_tonemap(float x, const GlowParams& p);
 
 }  // namespace glow_profond

@@ -50,6 +50,19 @@ kernel void downsample2(device const float4* src [[buffer(0)]], device float4* d
     dst[gid.y * dd.w + gid.x] = tap4(rows[0], rows[1], rows[2], rows[3]);
 }
 
+// Levels finer than the Quality resolution share its image: copy, and fold
+// them back with a plain sum instead of an upsample.
+kernel void copy_buf(device const float4* src [[buffer(0)]], device float4* dst [[buffer(1)]],
+                     constant uint& count [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+    if (i < count) dst[i] = src[i];
+}
+
+kernel void add_bufs(device const float4* a [[buffer(0)]], device const float4* b [[buffer(1)]],
+                     device float4* dst [[buffer(2)]], constant uint& count [[buffer(3)]],
+                     uint i [[thread_position_in_grid]]) {
+    if (i < count) dst[i] = a[i] + b[i];
+}
+
 // Per-channel Gaussian taps for one axis: channel c uses weights
 // k[off[c] .. off[c] + 2 r[c]]; r = 0 is the identity (sigma below 0.3).
 struct BlurParams {
@@ -216,10 +229,30 @@ struct CompositeParams {
     uint work_w;
     int view;    // 0 final, 1 glow only, 2 source, 3 behind
     int screen, gamma, tonemap;
+    int curve;   // 0 ACES, 1 Hable filmic, 2 Reinhard
+    float mix;   // tonemap mix
+    float opacity;  // source opacity
+    int pad;
 };
 
+static float hable(float x) {
+    const float a = 0.15f, b = 0.5f, c = 0.1f, d = 0.2f, e = 0.02f, f = 0.3f;
+    return (x * (a * x + c * b) + d * e) / (x * (a * x + b) + d * f) - e / f;
+}
+
 static float encode(float v, constant CompositeParams& cp) {
-    if (cp.tonemap) v = aces_fitted(v);
+    if (cp.tonemap) {  // apply_tonemap in the core
+        float t;
+        if (cp.curve == 1) {
+            t = hable(2.0f * max(v, 0.0f)) / hable(11.2f);
+        } else if (cp.curve == 2) {
+            const float x0 = max(v, 0.0f);
+            t = x0 / (1.0f + x0);
+        } else {
+            t = aces_fitted(v);
+        }
+        v = v + (t - v) * cp.mix;
+    }
     if (cp.gamma) v = linear_to_srgb(v);
     return v;
 }
@@ -231,7 +264,8 @@ kernel void composite(device const float4* work [[buffer(0)]], device const floa
                       uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= cp.dst_w || gid.y >= cp.dst_h) return;
     const uint i = uint(int(gid.y) + cp.dy) * cp.work_w + uint(int(gid.x) + cp.dx);
-    const float4 l = work[i];
+    // Source opacity scales the source in the composite only.
+    const float4 l = float4(work[i].xyz * cp.opacity, work[i].w * cp.opacity);
     const float a = l.w;
     float src_enc[3], rgb[3];
     for (int c = 0; c < 3; ++c) src_enc[c] = a > 0.0f ? encode(l[c] / a, cp) * a : 0.0f;

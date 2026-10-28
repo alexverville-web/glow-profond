@@ -376,7 +376,71 @@ static void test_transparent_layer_over_black_matches_opaque() {
     }
 }
 
+static void test_quality_keeps_the_look() {
+    // Lower Quality (global downsample) only softens fine detail: beyond a
+    // few texels from the shape the glow matches Full, and the energy is the
+    // same. It used to get dim and washed out (every level ~D times too wide).
+    Image src(768, 512, 3);
+    for (int y = 206; y < 306; ++y)
+        for (int x = 334; x < 434; ++x)
+            for (int c = 0; c < 3; ++c) src.px(x, y)[c] = 1.0f;
+    GlowParams p;
+    p.radius = 160.0f;
+    p.spread = 1.85f;
+    const Image full = glow_layer(src, p);
+    for (int d : {2, 4, 8}) {
+        p.downsample = d;
+        const Image q = glow_layer(src, p);
+        for (int dist : {3 * d, 60, 120, 220}) {
+            const float a = full.px(433 + dist, 256)[1], b = q.px(433 + dist, 256)[1];
+            CHECK(std::fabs(a - b) < 0.05f * a + 1e-4f);
+        }
+        CHECK(std::fabs(channel_sum(q, 1) - channel_sum(full, 1)) < 0.01 * channel_sum(full, 1));
+    }
+}
+
+static void test_core_size_keeps_the_glow() {
+    // A bigger core softens the centre but keeps the glow's energy and its
+    // halo (raising Core Size used to shrink the glow).
+    Image src(512, 512, 3);
+    for (int c = 0; c < 3; ++c) src.px(256, 256)[c] = 1.0f;
+    GlowParams p;
+    p.radius = 160.0f;
+    p.spread = 1.85f;
+    p.base_sigma_ref = 1.5f;
+    const Image base = glow_layer(src, p);
+    for (float core : {3.0f, 6.0f}) {
+        p.base_sigma = core;
+        const Image g = glow_layer(src, p);
+        CHECK(std::fabs(channel_sum(g, 1) - channel_sum(base, 1)) < 0.03 * channel_sum(base, 1));
+        CHECK(g.px(256, 256)[1] < base.px(256, 256)[1]);                // softer centre
+        CHECK(g.px(256 + 60, 256)[1] > 0.9f * base.px(256 + 60, 256)[1]);  // halo kept
+    }
+}
+
+static void test_anamorphic_angle() {
+    // Angle 0 is the plain stretch; 90 degrees equals the inverse aspect.
+    Image src(256, 256, 3);
+    for (int c = 0; c < 3; ++c) src.px(128, 128)[c] = 1.0f;
+    GlowParams p;
+    p.radius = 30.0f;
+    p.aspect = 4.0f;
+    const Image flat = glow_layer(src, p);
+    p.angle = 90.0f;
+    const Image turned = glow_layer(src, p);
+    GlowParams v = p;
+    v.angle = 0.0f;
+    v.aspect = 0.25f;
+    const Image tall = glow_layer(src, v);
+    CHECK(turned.px(128, 128 + 40)[1] > turned.px(128 + 40, 128)[1]);
+    CHECK(std::fabs(turned.px(128, 128 + 20)[1] - tall.px(128, 128 + 20)[1]) < 0.02f * tall.px(128, 128 + 20)[1]);
+    CHECK(flat.px(128 + 40, 128)[1] > flat.px(128, 128 + 40)[1]);
+}
+
 int main() {
+    test_quality_keeps_the_look();
+    test_core_size_keeps_the_glow();
+    test_anamorphic_angle();
     test_glow_does_not_depend_on_grid_position();
     test_transparent_layer_over_black_matches_opaque();
     test_screen_composite();

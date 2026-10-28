@@ -73,6 +73,9 @@ struct CompositeParams {
     int32_t dx, dy;
     uint32_t work_w;
     int32_t view, screen, gamma, tonemap;
+    int32_t curve;  // 0 ACES, 1 Hable, 2 Reinhard
+    float mix, opacity;
+    int32_t pad;
 };
 struct TentTaps {
     int32_t idx[4];
@@ -115,6 +118,7 @@ std::vector<TentTaps> tent_taps(int target, int n) {
 struct Plan {
     struct Level {
         int w = 0, h = 0;
+        int res = 0;  // lives at 1 / 2^res (max(k, Quality steps), as in the core)
         std::vector<float> kx, ky;  // three channels back to back
         BlurParams bx{}, by{};
     };
@@ -136,7 +140,6 @@ Plan make_plan(int W, int H, const GlowParams& p) {
     const Dims base = plan.chain.back();
     if (base.w == 0 || base.h == 0) return plan;
 
-    const float scale = float(1 << extra);
     // The core's level plan (per-level sigma, unnormalized weights), so the
     // GPU follows any change to it.
     const LevelPlan lp = level_plan(p);
@@ -148,18 +151,21 @@ Plan make_plan(int W, int H, const GlowParams& p) {
     const float ax = std::sqrt(p.aspect), ay = 1.0f / std::sqrt(p.aspect);
     int w = int(base.w), h = int(base.h);
     for (int k = 0; k < n; ++k) {
-        if (k > 0) {
+        const int res = std::max(k, extra);
+        if (k > 0 && res != plan.levels.back().res) {
             w = (w + 1) / 2;  // rounds up, like downsample2
             h = (h + 1) / 2;
         }
         Plan::Level lv;
         lv.w = w;
         lv.h = h;
-        // Shrunk by the variance the upsample chain adds back (see glow_layer).
-        const float extra_var = kTentStepVariance * (4.0f / 3.0f) * (1.0f - std::pow(4.0f, -float(k)));
+        lv.res = res;
+        // Shrunk by the variance the upsample steps back to the base add (see glow_core).
+        const float extra_var =
+            kTentStepVariance * (4.0f / 3.0f) * (1.0f - std::pow(4.0f, -float(res - extra)));
         const Rgb tint = tint_for_level(p.tint, k, n);
         // Sigma in this level's own pixels.
-        const float sigma_level = lp.sigmas[size_t(k)] / (std::pow(2.0f, float(k)) * scale);
+        const float sigma_level = lp.sigmas[size_t(k)] / std::pow(2.0f, float(res));
         for (int c = 0; c < 3; ++c) {
             const float s = sigma_level * p.rgb_radius[c];
             const float sx = std::sqrt(std::max((s * ax) * (s * ax) - extra_var, 0.0f));
@@ -190,7 +196,8 @@ Plan make_plan(int W, int H, const GlowParams& p) {
 struct GlowMetal::Impl {
     id<MTLDevice> device = nil;
     id<MTLCommandQueue> queue = nil;
-    id<MTLComputePipelineState> threshold, down, blur_h, blur_v, tent_x, tent_y_add, finish, prepare, composite;
+    id<MTLComputePipelineState> threshold, down, blur_h, blur_v, tent_x, tent_y_add, finish, prepare, composite, copy_buf,
+        add_bufs;
 
     id<MTLBuffer> buffer(size_t pixels) {
         return [device newBufferWithLength:std::max<size_t>(pixels, 1) * 16 options:MTLResourceStorageModePrivate];
@@ -262,6 +269,12 @@ struct GlowMetal::Impl {
             lv[k] = buffer(size_t(dd.w) * dd.h);
             [enc setBuffer:lv[k - 1] offset:0 atIndex:0];
             [enc setBuffer:lv[k] offset:0 atIndex:1];
+            if (plan.levels[k].res == plan.levels[k - 1].res) {  // shared image: copy
+                const uint32_t count = dd.w * dd.h;
+                bytes(enc, count, 2);
+                dispatch(enc, copy_buf, count, 1);
+                continue;
+            }
             bytes(enc, sd, 2);
             bytes(enc, dd, 3);
             dispatch(enc, down, dd.w, dd.h);
@@ -288,6 +301,17 @@ struct GlowMetal::Impl {
         // Tent cascade, coarsest to finest: lv[k] += tent(lv[k + 1]).
         id<MTLBuffer> acc = lv[n - 1];
         for (int k = int(n) - 2; k >= 0; --k) {
+            if (plan.levels[k + 1].res == plan.levels[k].res) {  // same resolution: plain sum
+                id<MTLBuffer> out = buffer(size_t(plan.levels[k].w) * plan.levels[k].h);
+                const uint32_t count = uint32_t(plan.levels[k].w * plan.levels[k].h);
+                [enc setBuffer:acc offset:0 atIndex:0];
+                [enc setBuffer:lv[k] offset:0 atIndex:1];
+                [enc setBuffer:out offset:0 atIndex:2];
+                bytes(enc, count, 3);
+                dispatch(enc, add_bufs, count, 1);
+                acc = out;
+                continue;
+            }
             const Dims sd{uint32_t(plan.levels[k + 1].w), uint32_t(plan.levels[k + 1].h)};
             const Dims dd{uint32_t(plan.levels[k].w), uint32_t(plan.levels[k].h)};
             const Dims rows{dd.w, sd.h};
@@ -385,8 +409,10 @@ std::unique_ptr<GlowMetal> GlowMetal::create_for_device(void* mtl_device, std::s
         m.finish = pipeline("finish");
         m.prepare = pipeline("prepare");
         m.composite = pipeline("composite");
+        m.copy_buf = pipeline("copy_buf");
+        m.add_bufs = pipeline("add_bufs");
         if (!m.threshold || !m.down || !m.blur_h || !m.blur_v || !m.tent_x || !m.tent_y_add || !m.finish ||
-            !m.prepare || !m.composite) {
+            !m.prepare || !m.composite || !m.copy_buf || !m.add_bufs) {
             return nullptr;
         }
         m.queue = [m.device newCommandQueue];
@@ -397,7 +423,9 @@ std::unique_ptr<GlowMetal> GlowMetal::create_for_device(void* mtl_device, std::s
 bool GlowMetal::supports(const GlowParams& p, bool has_depth, bool has_dirt) {
     const bool depth_used = has_depth && (p.depth_spread > 0.0f || p.occlusion);
     const bool dirt_used = has_dirt && p.dirt_amount > 0.0f;
-    return !depth_used && !dirt_used;
+    // Rotated anamorphic and lateral chromatic aberration are CPU-only too.
+    const bool rotated = p.aspect != 1.0f && std::fmod(p.angle, 180.0f) != 0.0f;
+    return !depth_used && !dirt_used && !rotated && p.ca_offset == 0.0f;
 }
 
 bool GlowMetal::glow_layer(const Image& src, const GlowParams& p, Image& out, Timing* timing) {
@@ -479,9 +507,10 @@ bool GlowMetal::encode_render_premultiplied(void* command_buffer, const HostFram
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     if (!enc) return false;
     const int view = p.view == View::Glow ? 1 : p.view == View::Source ? 2 : p.view == View::Behind ? 3 : 0;
+    const int curve = p.tonemap_curve == Tonemap::Hable ? 1 : p.tonemap_curve == Tonemap::Reinhard ? 2 : 0;
     CompositeParams cp{uint32_t(dst.width), uint32_t(dst.height), uint32_t(dst.pitch), dst.dx, dst.dy,
                        uint32_t(work_width), view, p.blend == Blend::Screen ? 1 : 0, p.gamma_correct ? 1 : 0,
-                       p.tonemap ? 1 : 0};
+                       p.tonemap ? 1 : 0, curve, p.tonemap_mix, p.source_opacity, 0};
     [enc setBuffer:work offset:0 atIndex:0];
     [enc setBuffer:glow offset:0 atIndex:1];
     [enc setBuffer:(__bridge id<MTLBuffer>)dst.buffer offset:0 atIndex:2];

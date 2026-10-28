@@ -80,6 +80,8 @@ int main(int argc, char** argv) {
     add("saturation", [](GlowParams& p) { p.saturation = 1.8f; });
     add("desaturated", [](GlowParams& p) { p.saturation = 0.0f; });
     add("downsample_sat", [](GlowParams& p) { p.downsample = 4; p.saturation = 0.5f; });
+    add("quality_8_r160", [](GlowParams& p) { p.downsample = 8; p.radius = 160.0f; p.spread = 1.85f; });
+    add("core_size", [](GlowParams& p) { p.base_sigma = 5.0f; p.base_sigma_ref = 1.5f; });
     // Without a depth or dirt image these must be no-ops, like on the CPU.
     add("depth_dirt_unset", [](GlowParams& p) { p.depth_spread = 1.0f; p.occlusion = true; p.dirt_amount = 1.0f; });
 
@@ -145,6 +147,17 @@ int main(int argc, char** argv) {
         addr("behind_screen", [](GlowParams& p) { p.view = glow_profond::View::Behind; p.blend = glow_profond::Blend::Screen; });
         addr("tonemap_unmult", [](GlowParams& p) { p.tonemap = true; p.unmult = true; });
         addr("linear_sat", [](GlowParams& p) { p.gamma_correct = false; p.saturation = 1.6f; });
+        addr("hable_mix_opacity", [](GlowParams& p) {
+            p.tonemap = true;
+            p.tonemap_curve = glow_profond::Tonemap::Hable;
+            p.tonemap_mix = 0.6f;
+            p.source_opacity = 0.35f;
+        });
+        addr("reinhard_quality4", [](GlowParams& p) {
+            p.tonemap = true;
+            p.tonemap_curve = glow_profond::Tonemap::Reinhard;
+            p.downsample = 4;
+        });
         for (const RCase& c : rc) {
             const Image ref = glow_profond::render_premultiplied(rgba, c.p);
             Image out;
