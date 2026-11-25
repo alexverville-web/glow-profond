@@ -1,3 +1,4 @@
 renders/
 __pycache__/
 build*/
+dist/
