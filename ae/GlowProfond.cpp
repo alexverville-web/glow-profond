@@ -56,6 +56,7 @@ enum {
     GP_THRESHOLD,
     GP_SPREAD_AMOUNT,
     GP_SATURATION,
+    GP_PRESERVE_HUE,
     GP_BLEND,
     GP_VIEW,
     GP_SOURCE_OPACITY,
@@ -193,7 +194,9 @@ enum {
     ID_SOURCE_OPACITY,
     ID_DIRT_INHERIT,
     ID_DIRT_THRESHOLD,
-    ID_EXPAND
+    ID_EXPAND,
+    // v0.5.1
+    ID_PRESERVE_HUE
 };
 
 enum { TINT_NONE = 1, TINT_TWO, TINT_THREE };
@@ -319,7 +322,7 @@ PF_Err ReadParams(PF_InData* in_data, PF_OutData* out_data, GlowParams& p, HostO
         GP_TEMPORAL,     GP_THRESHOLD_SMOOTH, GP_UNMULT,    GP_GAMMA,         GP_TONEMAP,      GP_BASE_SIGMA,
         GP_DOWNSAMPLE,   GP_SOURCE_OPACITY, GP_CA_AMOUNT,   GP_CA_CHANNELS,   GP_CA_OFFSET,    GP_ANGLE,
         GP_MASK_ENABLE,  GP_MASK_MODE,    GP_MASK_INVERT,   GP_DIRT_THRESHOLD, GP_DIRT_INHERIT, GP_TONEMAP_CURVE,
-        GP_TONEMAP_MIX,  GP_EXPAND};
+        GP_TONEMAP_MIX,  GP_EXPAND,       GP_PRESERVE_HUE};
     PF_ParamDef defs[GP_NUM_PARAMS];
     bool checked_out[GP_NUM_PARAMS] = {};
     for (int index : kValueParams) {
@@ -367,6 +370,7 @@ PF_Err ReadParams(PF_InData* in_data, PF_OutData* out_data, GlowParams& p, HostO
             p.ca_offset = ToFloat(defs[GP_CA_OFFSET]) * scale;  // centre and reach set at render
         }
         p.source_opacity = ToFloat(defs[GP_SOURCE_OPACITY]) / 100.0f;
+        p.preserve_hue = on(GP_PRESERVE_HUE);
         p.tonemap_curve = defs[GP_TONEMAP_CURVE].u.pd.value == CURVE_FILMIC     ? glow_profond::Tonemap::Hable
                           : defs[GP_TONEMAP_CURVE].u.pd.value == CURVE_REINHARD ? glow_profond::Tonemap::Reinhard
                                                                                 : glow_profond::Tonemap::Aces;
@@ -570,6 +574,9 @@ PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data) {
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Saturation", 0, 300, 0, 200, 100, PF_Precision_INTEGER, PF_ValueDisplayFlag_PERCENT, 0,
                          ID_SATURATION);
+    AEFX_CLR_STRUCT(def);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_CHECKBOXX("Preserve Hue", TRUE, 0, ID_PRESERVE_HUE);
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUP("Blend Mode", 2, BLEND_ADD, "Add|Screen", ID_BLEND);
     AEFX_CLR_STRUCT(def);

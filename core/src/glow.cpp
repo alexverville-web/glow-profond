@@ -849,6 +849,14 @@ Image render(const Image& src, const GlowParams& p, const Image* depth, const Im
             row[i] = apply_tonemap(row[i], p);
             if (p.gamma_correct) row[i] = linear_to_srgb(row[i]);
         }
+        if (p.preserve_hue) {
+            for (int x = 0; x < W; ++x) {
+                float* v = row + size_t(x) * 3;
+                const float m = std::max({v[0], v[1], v[2]});
+                if (m > 1.0f)
+                    for (int c = 0; c < 3; ++c) v[c] /= m;
+            }
+        }
     });
     return out;
 }
@@ -983,6 +991,10 @@ Image render_premultiplied(const Image& src, const GlowParams& p, const GlowInpu
                 const float added = std::max(encode(total) - encode(base), 0.0f);
                 rgb[c] = (glow_only ? 0.0f : src_enc[c]) + added;
                 peak = std::max(peak, rgb[c]);
+            }
+            if (p.preserve_hue && peak > 1.0f) {
+                for (int c = 0; c < 3; ++c) rgb[c] /= peak;
+                peak = 1.0f;
             }
             // Coverage: enough alpha for the colour to stay premultiplied
             // (colour <= alpha up to 1), so over black it shows exactly rgb.

@@ -75,7 +75,7 @@ struct CompositeParams {
     int32_t view, screen, gamma, tonemap;
     int32_t curve;  // 0 ACES, 1 Hable, 2 Reinhard
     float mix, opacity;
-    int32_t pad;
+    int32_t preserve_hue;
 };
 struct TentTaps {
     int32_t idx[4];
@@ -510,7 +510,7 @@ bool GlowMetal::encode_render_premultiplied(void* command_buffer, const HostFram
     const int curve = p.tonemap_curve == Tonemap::Hable ? 1 : p.tonemap_curve == Tonemap::Reinhard ? 2 : 0;
     CompositeParams cp{uint32_t(dst.width), uint32_t(dst.height), uint32_t(dst.pitch), dst.dx, dst.dy,
                        uint32_t(work_width), view, p.blend == Blend::Screen ? 1 : 0, p.gamma_correct ? 1 : 0,
-                       p.tonemap ? 1 : 0, curve, p.tonemap_mix, p.source_opacity, 0};
+                       p.tonemap ? 1 : 0, curve, p.tonemap_mix, p.source_opacity, p.preserve_hue ? 1 : 0};
     [enc setBuffer:work offset:0 atIndex:0];
     [enc setBuffer:glow offset:0 atIndex:1];
     [enc setBuffer:(__bridge id<MTLBuffer>)dst.buffer offset:0 atIndex:2];

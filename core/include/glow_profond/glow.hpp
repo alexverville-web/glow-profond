@@ -68,6 +68,11 @@ struct GlowParams {
     float source_opacity = 1.0f;     // the source in the composite (the glow is unaffected)
     bool dirt_inherit_color = false; // lens dirt lit by the tinted glow instead of the untinted one
     float dirt_threshold = 0.0f;     // cuts the dirt texture's dark values (0..1)
+    // Output pixels brighter than 1 are scaled down as a whole instead of
+    // clipped per channel: a coloured shape keeps its hue under its glow
+    // (clipping turned an orange core yellow with an orange rim, like an RGB
+    // split). Off for HDR work where values above 1 must survive.
+    bool preserve_hue = false;
 };
 
 // Planar-free, interleaved image with a fixed channel count.

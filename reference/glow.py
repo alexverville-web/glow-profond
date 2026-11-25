@@ -48,6 +48,9 @@ class GlowParams:
     source_opacity: float = 1.0      # the source in the composite (the glow is unaffected)
     dirt_inherit_color: bool = False  # lens dirt lit by the tinted glow instead of the untinted one
     dirt_threshold: float = 0.0      # cuts the dirt texture's dark values (0..1)
+    # Output brighter than 1 scaled down as a whole instead of clipped per
+    # channel: a coloured shape keeps its hue under its glow.
+    preserve_hue: bool = False
 
 
 def srgb_to_linear(x):
@@ -479,4 +482,6 @@ def render(src, p: GlowParams, depth=None, dirt=None):
             out = composite(shown, g, p.blend)
     out = tonemap(out, p)
     out = linear_to_srgb(out) if p.gamma_correct else out
+    if p.preserve_hue:
+        out = out / np.maximum(out.max(axis=-1, keepdims=True), 1.0)
     return out.astype(np.float32)

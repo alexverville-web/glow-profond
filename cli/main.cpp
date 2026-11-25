@@ -130,7 +130,7 @@ int usage() {
                  "  --base-sigma-ref F    core size reference sigma (0 = off)\n"
                  "  --angle DEG           anamorphic direction (0)\n"
                  "  --ca-offset F --ca-center X,Y --ca-rmax F --ca-pair rb|rg|gb  lateral chromatic aberration\n"
-                 "  --tonemap-curve aces|hable|reinhard  --tonemap-mix F  --source-opacity F\n"
+                 "  --tonemap-curve aces|hable|reinhard  --tonemap-mix F  --source-opacity F  --preserve-hue\n"
                  "  --view final|glow|source|behind\n"
                  "  --unmult  --tonemap  --linear (disable gamma correction)\n"
                  "  --bench N             time N renders and print the average\n";
@@ -179,6 +179,7 @@ int main(int argc, char** argv) {
                                               : glow_profond::Tonemap::Aces;
         } else if (a == "--tonemap-mix" && has_value) p.tonemap_mix = std::strtof(next(), nullptr);
         else if (a == "--source-opacity" && has_value) p.source_opacity = std::strtof(next(), nullptr);
+        else if (a == "--preserve-hue") p.preserve_hue = true;
         else if (a == "--downsample" && has_value) p.downsample = std::atoi(next());
         else if (a == "--tint" && has_value) {
             if (!tint_set) p.tint.clear();

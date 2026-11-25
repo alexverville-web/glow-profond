@@ -232,7 +232,7 @@ struct CompositeParams {
     int curve;   // 0 ACES, 1 Hable filmic, 2 Reinhard
     float mix;   // tonemap mix
     float opacity;  // source opacity
-    int pad;
+    int preserve_hue;  // scale > 1 pixels as a whole instead of clipping per channel
 };
 
 static float hable(float x) {
@@ -285,6 +285,10 @@ kernel void composite(device const float4* work [[buffer(0)]], device const floa
             const float added = max(encode(total, cp) - encode(base, cp), 0.0f);
             rgb[c] = (glow_only ? 0.0f : src_enc[c]) + added;
             peak = max(peak, rgb[c]);
+        }
+        if (cp.preserve_hue && peak > 1.0f) {
+            for (int c = 0; c < 3; ++c) rgb[c] /= peak;
+            peak = 1.0f;
         }
         alpha = max(glow_only ? 0.0f : a, min(peak, 1.0f));
     }

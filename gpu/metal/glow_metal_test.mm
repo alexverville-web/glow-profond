@@ -153,6 +153,10 @@ int main(int argc, char** argv) {
             p.tonemap_mix = 0.6f;
             p.source_opacity = 0.35f;
         });
+        addr("preserve_hue_hot", [](GlowParams& p) {
+            p.preserve_hue = true;
+            p.exposure = 1.5f;
+        });
         addr("reinhard_quality4", [](GlowParams& p) {
             p.tonemap = true;
             p.tonemap_curve = glow_profond::Tonemap::Reinhard;

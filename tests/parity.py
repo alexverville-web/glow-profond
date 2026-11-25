@@ -69,6 +69,8 @@ CASES = [
      ["--radius", "120", "--tonemap", "--tonemap-curve", "reinhard", "--exposure", "2"]),
     ("source_opacity", GlowParams(radius=120, source_opacity=0.4),
      ["--radius", "120", "--source-opacity", "0.4"]),
+    ("preserve_hue", GlowParams(radius=160, exposure=1.5, preserve_hue=True),
+     ["--radius", "160", "--exposure", "1.5", "--preserve-hue"]),
 ]
 
 

@@ -7,7 +7,7 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="$(sed -n 's/^project(GlowProfond VERSION \([0-9]*\.[0-9]*\).*/\1/p' "$REPO/CMakeLists.txt")"
+VERSION="$(sed -n 's/^project(GlowProfond VERSION \([0-9.]*\).*/\1/p' "$REPO/CMakeLists.txt")"
 NAME="Glow Profond $VERSION - Mac"
 DIST="$REPO/dist"
 STAGE="$DIST/stage"
