@@ -60,6 +60,11 @@ public:
     bool encode_render_premultiplied(void* command_buffer, const HostFrame& src, const HostFrame& dst,
                                      int work_width, int work_height, const GlowParams& p, bool clamp_premult);
 
+    // Debugging: copies a host frame back (after everything queued so far on
+    // command_queue) and writes it to `path` as a 4-channel float file
+    // ("GPF4" w h, then RGBA rows). Waits for the GPU.
+    bool debug_dump(void* command_queue, const HostFrame& frame, const char* path);
+
     // encode_render_premultiplied() in a new command buffer of the host's
     // MTLCommandQueue, committed (not waited on: the host orders its queue).
     bool submit_render_premultiplied(void* command_queue, const HostFrame& src, const HostFrame& dst,

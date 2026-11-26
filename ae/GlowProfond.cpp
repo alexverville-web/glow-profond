@@ -5,6 +5,9 @@
 // 8, 16 and 32 bpc are supported; buffers are converted to float RGBA.
 #include <algorithm>
 #include <cmath>
+#include <vector>
+#include <cstdio>
+#include <atomic>
 #include <memory>
 #include <string>
 #include <exception>
@@ -455,6 +458,50 @@ void ReadPixels(const PF_EffectWorld* world, float max_value, Image& img, int dx
             o[2] = std::min(float(row[x].blue) / max_value, cap);
         }
     });
+}
+
+// Debugging aid: with the file /tmp/glowprofond_debug present, renders log
+// their rects, worlds and parameters to /tmp/glowprofond.log and dump the
+// first frames' input and output (GPU path: /tmp/glowprofond_gpu_{in,out}_N,
+// CPU path: /tmp/glowprofond_cpu_{in,out}_N, "GPF4 w h" + RGBA floats).
+bool DebugEnabled() {
+    FILE* f = std::fopen("/tmp/glowprofond_debug", "r");
+    if (!f) return false;
+    std::fclose(f);
+    return true;
+}
+
+void DebugLog(const char* where, PF_InData* in_data, const RenderPlan* plan, const PF_LRect& bounds,
+              const PF_EffectWorld* input, const PF_EffectWorld* output, const GlowParams& p, int bitdepth) {
+    FILE* f = std::fopen("/tmp/glowprofond.log", "a");
+    if (!f) return;
+    std::fprintf(f,
+                 "%s t=%ld ds=%ld/%ld bpc=%d in_rect=[%ld %ld %ld %ld] out_rect=[%ld %ld %ld %ld] bounds=[%ld %ld %ld %ld] "
+                 "input=%ldx%ld rb=%ld output=%ldx%ld rb=%ld layer=%ldx%ld radius=%.2f exp=%.2f spread=%.2f base=%.2f "
+                 "ref=%.2f thr=%.2f q=%d view=%d blend=%d sat=%.2f hue=%d tm=%d op=%.2f rgb=%.2f/%.2f/%.2f aspect=%.2f\n",
+                 where, long(in_data->current_time), long(in_data->downsample_x.num), long(in_data->downsample_x.den),
+                 bitdepth, long(plan->input_rect.left), long(plan->input_rect.top), long(plan->input_rect.right),
+                 long(plan->input_rect.bottom), long(plan->output_rect.left), long(plan->output_rect.top),
+                 long(plan->output_rect.right), long(plan->output_rect.bottom), long(bounds.left), long(bounds.top),
+                 long(bounds.right), long(bounds.bottom), long(input->width), long(input->height), long(input->rowbytes),
+                 long(output->width), long(output->height), long(output->rowbytes), long(plan->layer_width),
+                 long(plan->layer_height), p.radius, p.exposure, p.spread, p.base_sigma, p.base_sigma_ref, p.threshold,
+                 p.downsample, int(p.view), int(p.blend), p.saturation, int(p.preserve_hue), int(p.tonemap),
+                 p.source_opacity, p.rgb_radius[0], p.rgb_radius[1], p.rgb_radius[2], p.aspect);
+    std::fclose(f);
+}
+
+void DebugDump(const char* path, const Image& img) {
+    FILE* f = std::fopen(path, "wb");
+    if (!f) return;
+    std::fprintf(f, "GPF4 %d %d\n", img.width, img.height);
+    std::vector<float> row(size_t(img.width) * 4);
+    for (int y = 0; y < img.height; ++y) {
+        for (int x = 0; x < img.width; ++x)
+            for (int c = 0; c < 4; ++c) row[size_t(x) * 4 + c] = c < img.channels ? img.px(x, y)[c] : 1.0f;
+        std::fwrite(row.data(), sizeof(float), row.size(), f);
+    }
+    std::fclose(f);
 }
 
 // ReadPixels for whichever depth AE handed us.
@@ -1049,6 +1096,18 @@ PF_Err SmartRender(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderExtra
             }
             if (!err) {
                 const Image result = glow_profond::render_premultiplied(src, p, inputs);
+                if (DebugEnabled()) {
+                    static std::atomic<int> dumps{0};
+                    const int n = dumps.fetch_add(1);
+                    DebugLog("CPU", in_data, plan, bounds, input, output, p, extra->input->bitdepth);
+                    if (n < 3) {
+                        char path[96];
+                        std::snprintf(path, sizeof(path), "/tmp/glowprofond_cpu_in_%d", n);
+                        DebugDump(path, src);
+                        std::snprintf(path, sizeof(path), "/tmp/glowprofond_cpu_out_%d", n);
+                        DebugDump(path, result);
+                    }
+                }
                 const A_long ox = plan->output_rect.left, oy = plan->output_rect.top;
                 switch (format) {
                     case PF_PixelFormat_ARGB128:
@@ -1146,6 +1205,18 @@ PF_Err SmartRenderGPU(PF_InData* in_data, PF_OutData* out_data, PF_SmartRenderEx
             const bool clamp_premult = extra->input->bitdepth < 32;
             if (!metal->submit_render_premultiplied(info.command_queuePV, src, dst, work_w, work_h, p, clamp_premult)) {
                 err = PF_Err_INTERNAL_STRUCT_DAMAGED;
+            }
+            if (!err && DebugEnabled()) {
+                static std::atomic<int> dumps{0};
+                const int n = dumps.fetch_add(1);
+                DebugLog("GPU", in_data, plan, bounds, input, output, p, extra->input->bitdepth);
+                if (n < 3) {
+                    char path[96];
+                    std::snprintf(path, sizeof(path), "/tmp/glowprofond_gpu_in_%d", n);
+                    metal->debug_dump(info.command_queuePV, src, path);
+                    std::snprintf(path, sizeof(path), "/tmp/glowprofond_gpu_out_%d", n);
+                    metal->debug_dump(info.command_queuePV, dst, path);
+                }
             }
         }
     }

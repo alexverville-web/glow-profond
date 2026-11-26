@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -518,6 +519,39 @@ bool GlowMetal::encode_render_premultiplied(void* command_buffer, const HostFram
     Impl::dispatch(enc, m.composite, uint32_t(dst.width), uint32_t(dst.height));
     [enc endEncoding];
     return true;
+}
+
+bool GlowMetal::debug_dump(void* command_queue, const HostFrame& frame, const char* path) {
+    @autoreleasepool {
+        id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)command_queue;
+        id<MTLBuffer> src = (__bridge id<MTLBuffer>)frame.buffer;
+        const size_t bytes = size_t(frame.pitch) * size_t(std::max(frame.height, 1)) * 16;
+        id<MTLBuffer> copy = [impl_->device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        [blit copyFromBuffer:src sourceOffset:0 toBuffer:copy destinationOffset:0 size:std::min<size_t>(bytes, src.length)];
+        [blit endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        FILE* f = std::fopen(path, "wb");
+        if (!f) return false;
+        std::fprintf(f, "GPF4 %d %d\n", frame.width, frame.height);
+        const float* p = static_cast<const float*>(copy.contents);
+        std::vector<float> row(size_t(frame.width) * 4);
+        for (int y = 0; y < frame.height; ++y) {
+            for (int x = 0; x < frame.width; ++x) {
+                const float* s = p + (size_t(y) * frame.pitch + x) * 4;  // BGRA
+                float* d = row.data() + size_t(x) * 4;
+                d[0] = s[2];
+                d[1] = s[1];
+                d[2] = s[0];
+                d[3] = s[3];
+            }
+            std::fwrite(row.data(), sizeof(float), row.size(), f);
+        }
+        std::fclose(f);
+        return true;
+    }
 }
 
 bool GlowMetal::submit_render_premultiplied(void* command_queue, const HostFrame& src, const HostFrame& dst,

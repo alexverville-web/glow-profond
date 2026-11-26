@@ -12,7 +12,7 @@
 
 #define GP_MAJOR_VERSION 0
 #define GP_MINOR_VERSION 5
-#define GP_BUG_VERSION 1
+#define GP_BUG_VERSION 2
 #define GP_STAGE_VERSION 0 /* PF_Stage_DEVELOP */
 #define GP_BUILD_VERSION 1
 
