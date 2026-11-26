@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
-from glow import (GlowParams, composite, glow_layer, level_weights, render,  # noqa: E402
+from glow import (GlowParams, composite, glow_layer, level_plan, render,  # noqa: E402
                   soft_threshold, upsample_tent2)
 
 
@@ -25,7 +25,21 @@ def test_threshold_never_amplifies():
 
 
 def test_inverse_square_weights_are_equal():
-    assert np.allclose(level_weights(6, 2.0), 1 / 6)
+    sigmas, w = level_plan(1.5 * 32, 1.5, 2.0)  # exactly 6 octaves
+    assert np.allclose(w, 1.0) and np.allclose(sigmas, 1.5 * 2.0 ** np.arange(6))
+
+
+def test_radius_is_continuous_and_monotonic():
+    # Sliding the radius never shrinks the halo, and never jumps.
+    img = _point()
+    prev = None
+    for r in np.linspace(20, 70, 26):
+        g = glow_layer(img, GlowParams(radius=float(r)))
+        far = g[128, 128 + 60, 1]
+        if prev is not None:
+            assert far >= prev[0] - 1e-9
+            assert np.abs(g - prev[1]).max() < 0.05 * g.max()
+        prev = (far, g)
 
 
 def test_tent_upsample_keeps_constant_and_odd_shapes():
@@ -40,7 +54,9 @@ def test_point_glow_is_inverse_square_and_conserves_energy():
     prof = g[256, 256:]
     slope = np.log(prof[64] / prof[16]) / np.log(4)
     assert abs(slope + 2) < 0.1, slope
-    assert abs(g.sum() - 1000) < 20, g.sum()
+    # Energy is 1000 per unit of level weight (weights are not normalized).
+    total = level_plan(100, 1.5, 2.0)[1].sum()
+    assert abs(g.sum() - 1000 * total) < 20 * total, g.sum()
 
 
 def _point(n=256, value=1000.0):
@@ -71,8 +87,8 @@ def test_dirt_adds_untinted_wide_glow_only():
     assert np.array_equal(base, glow_layer(img, p, dirt=np.ones((256, 256, 3))))  # amount 0
     p.dirt_amount = 1.0
     extra = glow_layer(img, p, dirt=np.ones((256, 256, 3))) - base
-    n = 6  # floor(log2(50 / 1.5)) + 1
-    expected = level_weights(n, 2.0)[n // 2:].sum() * 1000
+    _, w = level_plan(50, 1.5, 2.0)
+    expected = w[len(w) // 2:].sum() * 1000
     assert np.allclose(extra.sum(axis=(0, 1)), expected, rtol=0.03)  # untinted: G and B too
 
 
@@ -108,3 +124,15 @@ if __name__ == "__main__":
         if name.startswith("test_"):
             fn()
             print("ok", name)
+
+
+def test_buffer_size_does_not_move_the_glow():
+    # Hosts pad the buffer by an amount that follows the radius: the glow
+    # must stay centred on its source whatever the (odd) buffer size.
+    def glow_in(size):
+        img = np.zeros((size, size, 3), np.float32)
+        img[40:90, 40:90] = 1.0
+        return glow_layer(img, GlowParams(radius=100))[..., 0]
+    a, b = glow_in(257), glow_in(300)
+    assert np.abs(a[:128, :128] - b[:128, :128]).max() < 0.01 * a[65, 30]
+    assert abs(a[65, 30] - a[65, 99]) < 0.03 * a[65, 30]
